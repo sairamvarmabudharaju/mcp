@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Iterable, List, Optional
+from collections import Counter
+from functools import lru_cache
+from typing import Any, Collection, Dict, Iterable, List, Optional
 import re
 from urllib.parse import urlparse
 
@@ -26,6 +28,20 @@ from .config import DISTANCE_THRESHOLD, K_RESULTS
 
 SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_\-+.]*", re.IGNORECASE)
 TOKEN_SPLIT_PATTERN = re.compile(r"[_\-+.]+")
+COMPOUND_SPLIT_PATTERN = re.compile(r"[_-]+")
+COMPOUND_EXTENSION_PATTERN = re.compile(r"\.(?:c|cc|cpp|go|h|hh|hpp|java|js|py|s)$")
+COMPOUND_PART_PATTERN = re.compile(r"[a-z0-9]+(?:\.[0-9]+[a-z0-9]*)*")
+COMPOUND_MAX_PARTS = 4
+COMPOUND_CANDIDATE_LIMIT = 30
+COMPOUND_RRF_WEIGHT = 0.25
+COMPOUND_TECHNICAL_MARKERS = {
+    "aarch64", "arm", "arm64", "cme", "cortex", "cpu", "ethos", "fp32", "gcc",
+    "gemv", "gke", "gnu", "gpu", "int8", "kv", "llvm", "matmul", "mcp", "neon",
+    "neoverse", "npu", "simd", "sme", "sve", "x86",
+}
+COMPOUND_EDGE_STOPWORDS = {
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "with",
+}
 RRF_K = 60
 LEXICAL_PREPASS_DEPTH = 400
 PINNED_LEXICAL_CANDIDATES = 20
@@ -87,6 +103,67 @@ NEGATIVE_SUPPORT_PATTERNS = tuple(
 
 def tokenize_for_search(text: str) -> List[str]:
     return [token.lower() for token in SEARCH_TOKEN_PATTERN.findall(text or "")]
+
+
+@lru_cache(maxsize=4096)
+def _compound_parts(token: str) -> Optional[tuple[str, ...]]:
+    """Normalize a bounded technical compound while preserving version numbers."""
+    if "_" not in token and "-" not in token:
+        return None
+    normalized = COMPOUND_EXTENSION_PATTERN.sub("", token.lower().rstrip("._-"))
+    if not any(character.isalpha() for character in normalized):
+        return None
+    parts = tuple(COMPOUND_SPLIT_PATTERN.split(normalized))
+    if not 2 <= len(parts) <= COMPOUND_MAX_PARTS:
+        return None
+    if any(len(part) < 2 or not COMPOUND_PART_PATTERN.fullmatch(part) for part in parts):
+        return None
+    if parts[0] in COMPOUND_EDGE_STOPWORDS or parts[-1] in COMPOUND_EDGE_STOPWORDS:
+        return None
+    if not (set(parts) & COMPOUND_TECHNICAL_MARKERS) and not any(
+        character.isdigit() for character in normalized
+    ):
+        return None
+    return parts
+
+
+def _matching_compounds(
+    text: str,
+    compounds: Collection[tuple[str, ...]],
+    starts: set[str],
+    *,
+    longest_only: bool = True,
+) -> set[tuple[str, ...]]:
+    """Recognize whole known compounds across spaces, hyphens and underscores."""
+    if not compounds:
+        return set()
+    words: List[Optional[str]] = []
+    previous_end = 0
+    for match in SEARCH_TOKEN_PATTERN.finditer(text or ""):
+        if words and not text[previous_end:match.start()].isspace():
+            words.append(None)
+        token = match.group().lower()
+        words.extend(_compound_parts(token) or (token.rstrip("."),))
+        if token.endswith("."):
+            words.append(None)
+        previous_end = match.end()
+    matches: set[tuple[str, ...]] = set()
+    start = 0
+    while start < len(words):
+        if words[start] not in starts:
+            start += 1
+            continue
+        # Prefer complete query terms; documents also index overlapping subphrases.
+        for size in range(min(COMPOUND_MAX_PARTS, len(words) - start), 1, -1):
+            parts = tuple(words[start:start + size])
+            if parts in compounds:
+                matches.add(parts)
+                if longest_only:
+                    start += size
+                    break
+        else:
+            start += 1
+    return matches
 
 
 def tokenize_url_for_search(text: str) -> List[str]:
@@ -265,7 +342,20 @@ def build_bm25_index(metadata: List[Dict]) -> Optional[BM25Okapi]:
     corpus = [tokenize_for_search(item.get("search_text", "")) for item in metadata]
     if not any(corpus):
         return None
-    return BM25Okapi(corpus)
+    index = BM25Okapi(corpus)
+    # Learn compounds from existing tokens, preserving the original BM25 statistics.
+    compounds = {parts: [] for token in index.idf if (parts := _compound_parts(token))}
+    starts = {parts[0] for parts in compounds}
+    for document_index, item in enumerate(metadata):
+        for parts in _matching_compounds(item.get("search_text", ""), compounds, starts, longest_only=False):
+            compounds[parts].append(document_index)
+    # Ignore ubiquitous terms copied across unrelated chunks.
+    max_frequency = max(200, int(index.corpus_size * 0.02))
+    index.compound_postings = {
+        parts: indexes for parts, indexes in compounds.items() if len(indexes) <= max_frequency
+    }
+    index.compound_starts = {parts[0] for parts in index.compound_postings}
+    return index
 
 
 def embedding_search(
@@ -315,17 +405,17 @@ def embedding_search(
     return results
 
 
-def bm25_search(
+def _bm25_search_with_scores(
     query: str,
     metadata: List[Dict],
     bm25_index: Optional[BM25Okapi],
     k: int = K_RESULTS,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
     if bm25_index is None:
-        return []
+        return [], None
     tokens = tokenize_for_search(query)
     if not tokens:
-        return []
+        return [], None
     scores = bm25_index.get_scores(tokens)
     ranking = np.argsort(scores)[::-1]
     results: List[Dict[str, Any]] = []
@@ -340,7 +430,37 @@ def bm25_search(
                 "metadata": metadata[int(idx)],
             }
         )
+    return results, scores
+
+
+def bm25_search(
+    query: str,
+    metadata: List[Dict],
+    bm25_index: Optional[BM25Okapi],
+    k: int = K_RESULTS,
+) -> List[Dict[str, Any]]:
+    results, _ = _bm25_search_with_scores(query, metadata, bm25_index, k)
     return results
+
+
+def _compound_candidates(
+    query: str,
+    metadata: List[Dict],
+    bm25_index: Optional[BM25Okapi],
+    bm25_scores: Optional[np.ndarray],
+) -> List[Dict[str, Any]]:
+    """Retrieve complete compound matches using the existing BM25 score array."""
+    if bm25_scores is None:
+        return []
+    postings = getattr(bm25_index, "compound_postings", {})
+    matches = _matching_compounds(query, postings, getattr(bm25_index, "compound_starts", set()))
+    counts = Counter(index for parts in matches for index in postings[parts])
+    # Prefer more complete matches, then the existing BM25 score; break ties by index.
+    ranking = sorted(counts, key=lambda index: (-counts[index], -bm25_scores[index], index))
+    return [
+        {"rank": rank, "bm25_score": float(bm25_scores[index]), "metadata": metadata[index]}
+        for rank, index in enumerate(ranking[:COMPOUND_CANDIDATE_LIMIT], start=1)
+    ]
 
 
 def _overlap_ratio(query_tokens: set[str], document_tokens: set[str]) -> float:
@@ -534,7 +654,7 @@ def hybrid_search(
     candidate_depth = candidate_depth or max(k * 20, 100)
     lexical_k = max(k * 3, PINNED_LEXICAL_CANDIDATES)
     # Score and sort once at the depth required by both lexical consumers.
-    bm25_results = bm25_search(
+    bm25_results, bm25_scores = _bm25_search_with_scores(
         query,
         metadata,
         bm25_index,
@@ -566,6 +686,12 @@ def hybrid_search(
         existing["rank"] = min(existing.get("rank", result["rank"]), result["rank"])
         existing["bm25_score"] = result["bm25_score"]
         existing["rrf_score"] += 1 / (RRF_K + result["rank"])
+        candidates[candidate_key] = existing
+
+    for result in _compound_candidates(query, metadata, bm25_index, bm25_scores):
+        candidate_key = _candidate_key(result)
+        existing = candidates.get(candidate_key, {**result, "rrf_score": 0.0})
+        existing["rrf_score"] += COMPOUND_RRF_WEIGHT / (RRF_K + result["rank"])
         candidates[candidate_key] = existing
 
     combined = rerank_candidates(query, list(candidates.values()))
