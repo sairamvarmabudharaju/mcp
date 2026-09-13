@@ -17,11 +17,21 @@ import datetime
 import glob
 import json
 import os
+import re
+from typing import Any
 
 import numpy as np
 import yaml
 from sentence_transformers import SentenceTransformer
 from usearch.index import Index
+
+EMBEDDING_WINDOW_OVERLAP_TOKENS = 32
+MAX_EMBEDDING_CONTEXT_TOKENS = 64
+EMBEDDING_TOKEN_SAFETY_MARGIN = 2
+CONTENT_PREFIX_PATTERN = re.compile(
+    r"^Document Title:\s*(.*?)\nHeading Path:\s*(.*?)\n\n",
+    re.DOTALL,
+)
 
 
 def load_local_yaml_files() -> list[dict]:
@@ -72,14 +82,214 @@ def load_local_yaml_files() -> list[dict]:
     return yaml_contents
 
 
-def create_embeddings(contents: list[str], model_path: str) -> np.ndarray:
-    """Create embeddings for the given contents using SentenceTransformers."""
-    print(f"Creating embeddings using local model: {model_path}")
-    model = SentenceTransformer(
+def load_embedding_model(model_path: str) -> SentenceTransformer:
+    """Load the local SentenceTransformer used for splitting and embedding."""
+    return SentenceTransformer(
         model_path,
         local_files_only=True,
         trust_remote_code=False,
     )
+
+
+def _token_offsets(tokenizer: Any, text: str) -> list[tuple[int, int]]:
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        truncation=False,
+        padding=False,
+    )
+    return [tuple(offset) for offset in encoded["offset_mapping"] if tuple(offset) != (0, 0)]
+
+
+def _truncate_to_tokens(tokenizer: Any, text: str, max_tokens: int) -> str:
+    offsets = _token_offsets(tokenizer, text)
+    if len(offsets) <= max_tokens:
+        return text
+    return text[: offsets[max_tokens - 1][1]]
+
+
+def _window_spans(
+    tokenizer: Any,
+    text: str,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[tuple[int, int]]:
+    if max_tokens <= 0:
+        raise ValueError("Embedding body token budget must be positive")
+    if overlap_tokens < 0 or overlap_tokens >= max_tokens:
+        raise ValueError("Embedding overlap must be smaller than the body token budget")
+    offsets = _token_offsets(tokenizer, text)
+    if len(offsets) <= max_tokens:
+        return [(0, len(text))]
+
+    spans = []
+    start_token = 0
+    while start_token < len(offsets):
+        end_token = min(len(offsets), start_token + max_tokens)
+        start_char = 0 if start_token == 0 else offsets[start_token][0]
+        end_char = len(text) if end_token == len(offsets) else offsets[end_token][0]
+        spans.append((start_char, end_char))
+        if end_token == len(offsets):
+            break
+        start_token = end_token - overlap_tokens
+    return spans
+
+
+def _embedding_context(yaml_content: dict, tokenizer: Any) -> str:
+    heading_path = yaml_content.get("heading_path", []) or []
+    values = [yaml_content.get("title", "")]
+    if heading_path:
+        values.append(str(heading_path[-1]))
+    elif yaml_content.get("heading"):
+        values.append(str(yaml_content["heading"]))
+    unique_values = []
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized not in unique_values:
+            unique_values.append(normalized)
+    return _truncate_to_tokens(
+        tokenizer,
+        "\n".join(unique_values),
+        MAX_EMBEDDING_CONTEXT_TOKENS,
+    )
+
+
+def _content_body(content: str) -> str:
+    match = CONTENT_PREFIX_PATTERN.match(content)
+    return content[match.end():] if match else content
+
+
+def _metadata_for_window(
+    yaml_content: dict,
+    original_text: str,
+    search_text_content: str,
+    chunk_uuid: str,
+    parent_chunk_uuid: str,
+    chunk_index: int,
+    chunk_count: int,
+    content_start_char: int,
+    content_end_char: int,
+    parent_content_length: int,
+    embedding_token_count: int,
+) -> dict:
+    heading_path = yaml_content.get("heading_path", []) or []
+    search_text = " ".join(
+        str(value)
+        for value in [
+            yaml_content.get("title", ""),
+            " ".join(heading_path),
+            yaml_content.get("heading", ""),
+            yaml_content.get("doc_type", ""),
+            yaml_content.get("product", ""),
+            yaml_content.get("version", ""),
+            yaml_content.get("keywords", ""),
+            search_text_content,
+        ]
+        if value
+    )
+    return {
+        "uuid": yaml_content["uuid"],
+        "url": yaml_content["url"],
+        "resolved_url": yaml_content.get("resolved_url", yaml_content["url"]),
+        "original_text": original_text,
+        "title": yaml_content["title"],
+        "keywords": yaml_content["keywords"],
+        "chunk_uuid": chunk_uuid,
+        "parent_chunk_uuid": parent_chunk_uuid,
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "content_start_char": content_start_char,
+        "content_end_char": content_end_char,
+        "parent_content_length": parent_content_length,
+        "embedding_token_count": embedding_token_count,
+        "heading": yaml_content.get("heading", ""),
+        "heading_path": heading_path,
+        "doc_type": yaml_content.get("doc_type", ""),
+        "product": yaml_content.get("product", ""),
+        "version": yaml_content.get("version", ""),
+        "content_type": yaml_content.get("content_type", ""),
+        "search_text": search_text,
+    }
+
+
+def prepare_embedding_records(
+    yaml_contents: list[dict],
+    tokenizer: Any,
+    max_seq_length: int,
+    overlap_tokens: int = EMBEDDING_WINDOW_OVERLAP_TOKENS,
+) -> tuple[list[str], list[dict]]:
+    """Create lossless overlapping windows that fit the embedding model."""
+    special_tokens = tokenizer.num_special_tokens_to_add(pair=False)
+    contents = []
+    metadata = []
+    for yaml_content in yaml_contents:
+        source_content = yaml_content["content"]
+        body = _content_body(source_content)
+        context = _embedding_context(yaml_content, tokenizer)
+        separator = "\n\n" if context and body else ""
+        context_token_count = len(
+            tokenizer(
+                f"{context}{separator}",
+                add_special_tokens=False,
+                truncation=False,
+                padding=False,
+            )["input_ids"]
+        )
+        body_budget = (
+            max_seq_length
+            - special_tokens
+            - context_token_count
+            - EMBEDDING_TOKEN_SAFETY_MARGIN
+        )
+        spans = _window_spans(tokenizer, body, body_budget, overlap_tokens)
+        parent_chunk_uuid = yaml_content["chunk_uuid"]
+        chunk_count = len(spans)
+        for chunk_index, (start_char, end_char) in enumerate(spans, start=1):
+            body_window = body[start_char:end_char]
+            embedding_text = f"{context}{separator}{body_window}"
+            embedding_token_count = len(
+                tokenizer(
+                    embedding_text,
+                    add_special_tokens=True,
+                    truncation=False,
+                    padding=False,
+                )["input_ids"]
+            )
+            if embedding_token_count > max_seq_length:
+                raise ValueError(
+                    f"Embedding window exceeds model limit: {embedding_token_count} > "
+                    f"{max_seq_length} for {parent_chunk_uuid}"
+                )
+            chunk_uuid = parent_chunk_uuid
+            if chunk_count > 1:
+                chunk_uuid = f"{parent_chunk_uuid}__window_{chunk_index}_of_{chunk_count}"
+            original_text = source_content if chunk_count == 1 else body_window
+            search_text_content = source_content if chunk_index == 1 else body_window
+            contents.append(embedding_text)
+            metadata.append(
+                _metadata_for_window(
+                    yaml_content,
+                    original_text,
+                    search_text_content,
+                    chunk_uuid,
+                    parent_chunk_uuid,
+                    chunk_index,
+                    chunk_count,
+                    start_char,
+                    end_char,
+                    len(body),
+                    embedding_token_count,
+                )
+            )
+    return contents, metadata
+
+
+def create_embeddings(
+    contents: list[str],
+    model: SentenceTransformer,
+) -> np.ndarray:
+    """Create embeddings for the given contents using SentenceTransformers."""
     embeddings = model.encode(contents, show_progress_bar=True, convert_to_numpy=True)
     print(f"Created embeddings with shape: {embeddings.shape}")
     return embeddings
@@ -123,6 +333,11 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to the embedding model created by acquire-model.py.",
     )
+    parser.add_argument(
+        "--skip-embeddings-text",
+        action="store_true",
+        help="Do not write the optional plain-text embedding matrix.",
+    )
     return parser.parse_args()
 
 
@@ -133,55 +348,29 @@ def main():
     # Load local YAML files
     yaml_contents = load_local_yaml_files()
 
-    # Extract content, uuid, url, and original text from YAML files
-    print("Extracting content and metadata from YAML files")
-    contents = []
-    metadata = []
-    for i, yaml_content in enumerate(yaml_contents, 1):
-        if i <= 10 or i % 1000 == 0 or i == len(yaml_contents):
-            print(f"Processing YAML content {i}/{len(yaml_contents)}")
-        contents.append(yaml_content["content"])
-        heading_path = yaml_content.get("heading_path", []) or []
-        search_text = " ".join(
-            str(value)
-            for value in [
-                yaml_content.get("title", ""),
-                " ".join(heading_path),
-                yaml_content.get("heading", ""),
-                yaml_content.get("doc_type", ""),
-                yaml_content.get("product", ""),
-                yaml_content.get("version", ""),
-                yaml_content.get("keywords", ""),
-                yaml_content.get("content", ""),
-            ]
-            if value
-        )
-        metadata.append(
-            {
-                "uuid": yaml_content["uuid"],
-                "url": yaml_content["url"],
-                "resolved_url": yaml_content.get("resolved_url", yaml_content["url"]),
-                "original_text": yaml_content["content"],
-                "title": yaml_content["title"],
-                "keywords": yaml_content["keywords"],
-                "chunk_uuid": yaml_content["chunk_uuid"],
-                "heading": yaml_content.get("heading", ""),
-                "heading_path": heading_path,
-                "doc_type": yaml_content.get("doc_type", ""),
-                "product": yaml_content.get("product", ""),
-                "version": yaml_content.get("version", ""),
-                "content_type": yaml_content.get("content_type", ""),
-                "search_text": search_text,
-            }
-        )
+    print(f"Loading embedding model: {args.model_path}")
+    model = load_embedding_model(args.model_path)
+
+    print("Creating tokenizer-aligned embedding windows")
+    contents, metadata = prepare_embedding_records(
+        yaml_contents,
+        model.tokenizer,
+        model.max_seq_length,
+    )
+    split_parents = len({item["parent_chunk_uuid"] for item in metadata if item["chunk_count"] > 1})
+    print(
+        f"Prepared {len(contents)} embedding windows from {len(yaml_contents)} source chunks; "
+        f"split {split_parents} oversized chunks"
+    )
 
     # Create embeddings
-    embeddings = create_embeddings(contents, args.model_path)
+    embeddings = create_embeddings(contents, model)
 
-    print("Saving embeddings to file")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"embeddings_{timestamp}.txt"
-    np.savetxt(filename, embeddings)
+    if not args.skip_embeddings_text:
+        print("Saving embeddings to file")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"embeddings_{timestamp}.txt"
+        np.savetxt(filename, embeddings)
 
     # Create USearch index
     print("Creating USearch index")

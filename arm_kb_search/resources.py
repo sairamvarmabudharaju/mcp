@@ -117,6 +117,7 @@ def search(
     query: str,
     resources: SearchResources,
     k: int | None = None,
+    include_debug: bool = False,
 ) -> list[dict[str, Any]]:
     resolved_k = k or resources.default_k
     candidate_depth = max(resolved_k * 20, 100)
@@ -130,8 +131,9 @@ def search(
         candidate_depth=candidate_depth,
     )
     deduped = deduplicate_urls(search_results)[:resolved_k]
-    formatted = [
-        {
+    formatted = []
+    for rank, item in enumerate(deduped, start=1):
+        result = {
             "url": item["metadata"].get("url"),
             "snippet": item["metadata"].get("original_text", item["metadata"].get("content", "")),
             "title": item["metadata"].get("title", ""),
@@ -141,8 +143,14 @@ def search(
             "distance": item.get("distance"),
             "score": item.get("rerank_score", item.get("rrf_score")),
         }
-        for item in deduped
-    ]
+        if include_debug:
+            result["debug"] = {
+                **item.get("score_debug", {}),
+                "result_rank": rank,
+                "returned_results": len(deduped),
+                "requested_results": resolved_k,
+            }
+        formatted.append(result)
     formatted = add_utm_source_to_results(formatted, resources.utm_source)
     if resources.include_disclaimers:
         return add_disclaimer_to_arm_results(formatted)

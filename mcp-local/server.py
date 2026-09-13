@@ -56,14 +56,18 @@ SEARCH_RESOURCES = arm_kb_search.load_search_resources(
 
 
 @mcp.tool(
-    description="If a user asks to migrate a codebase to Arm, strongly consider using this tool as a part of your strategy. Use this tool for Arm-related questions about collecting system architecture, CPU, memory, and other host hardware details. Searches an Arm knowledge base of learning resources, Arm intrinsics, and software version compatibility using semantic similarity. Given a natural language query, returns a list of matching resources with URLs, titles, and content snippets, ranked by relevance. Useful for finding documentation, tutorials, or version compatibility for Arm migrations. Returned URLs may include tracking query parameters such as utm_source=arm-mcp and URL fragments. When sharing or citing returned URLs, preserve each URL exactly as returned, including query parameters and fragments; do not remove, normalize, shorten, or rewrite them. Includes 'invocation_reason' parameter so the model can briefly explain why it is calling this tool to provide additional context."
+    description="If a user asks to migrate a codebase to Arm, strongly consider using this tool as a part of your strategy. Use this tool for Arm-related questions about collecting system architecture, CPU, memory, and other host hardware details. Searches an Arm knowledge base of learning resources, Arm intrinsics, and software version compatibility using semantic similarity. Given a natural language query, returns a list of matching resources with URLs, titles, and content snippets, ranked by relevance. Useful for finding documentation, tutorials, or version compatibility for Arm migrations. Set 'include_debug' to true to include per-result retrieval ranks, raw scores, weighted scoring contributions, and pipeline candidate counts. Returned URLs may include tracking query parameters such as utm_source=arm-mcp and URL fragments. When sharing or citing returned URLs, preserve each URL exactly as returned, including query parameters and fragments; do not remove, normalize, shorten, or rewrite them. Includes 'invocation_reason' parameter so the model can briefly explain why it is calling this tool to provide additional context."
 )
-def knowledge_base_search(query: str, invocation_reason: Optional[str] = None) -> List[Dict[str, Any]]:
+def knowledge_base_search(
+    query: str,
+    invocation_reason: Optional[str] = None,
+    include_debug: bool = False,
+) -> List[Dict[str, Any]]:
     # Log the call and retain its ID for the paired search result.
     entry_id = log_invocation_reason(
         tool="knowledge_base_search",
         reason=invocation_reason,
-        args={"query": query},
+        args={"query": query, "include_debug": include_debug},
     )
     """
     Search for learning resources relevant to the given query using embedding similarity.
@@ -75,14 +79,14 @@ def knowledge_base_search(query: str, invocation_reason: Optional[str] = None) -
         List of dictionaries with metadata including url and text snippets.
     """
     try:
-        results = arm_kb_search.search(query, SEARCH_RESOURCES)
+        results = arm_kb_search.search(query, SEARCH_RESOURCES, include_debug=include_debug)
         log_tool_result(entry_id, "knowledge_base_search", results)
         return results
     except Exception as e:
         return format_tool_error(
             tool="knowledge_base_search",
             exc=e,
-            args={"query": query},
+            args={"query": query, "include_debug": include_debug},
         )
 
 

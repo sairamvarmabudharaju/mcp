@@ -176,6 +176,27 @@ args = [
 
 After updating the configuration, restart your MCP client to load the Arm MCP server.
 
+### Inspect search scoring
+
+Pass `include_debug: true` to `knowledge_base_search` to inspect how each result was ranked. The normal response is unchanged when the option is omitted or false.
+
+The debug payload includes:
+
+- dense, BM25, and lexical-prepass ranks and raw scores
+- each retrieval source's reciprocal-rank-fusion contribution
+- the weighted contribution from every reranking signal
+- query tokens and the selected short- or long-query scoring profile
+- candidate counts before fusion and URL deduplication
+
+Example arguments:
+
+```json
+{
+  "query": "Python NumPy arm64 compatibility",
+  "include_debug": true
+}
+```
+
 ## Logging
 
 Depending on usage, the server may write two log files under `/workspace`. With the

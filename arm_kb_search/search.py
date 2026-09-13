@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Iterable, List, Optional
 import re
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -22,7 +22,6 @@ from sentence_transformers import SentenceTransformer
 from usearch.index import Index
 
 from .config import DISTANCE_THRESHOLD, K_RESULTS
-
 
 SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_\-+.]*", re.IGNORECASE)
 TOKEN_SPLIT_PATTERN = re.compile(r"[_\-+.]+")
@@ -40,9 +39,11 @@ SEARCH_STOPWORDS = {
     "options", "performance", "processor", "processors", "reference", "setup", "tutorial",
 }
 DIRECT_INTENT_STOPWORDS = {
-    "a", "an", "and", "are", "as", "be", "both", "by", "can", "do", "does", "for", "from",
-    "how", "i", "in", "into", "is", "it", "of", "on", "or", "same", "should", "that", "the",
-    "them", "to", "versus", "what", "when", "where", "which", "who", "why", "with",
+    "a", "about", "an", "and", "are", "arm", "as", "be", "best", "both", "by", "can", "do",
+    "does", "for", "from", "get", "give", "how", "i", "in", "into", "is", "it", "learn",
+    "learning", "lp", "me", "my", "new", "of", "on", "or", "path", "run", "same", "should",
+    "that", "the", "them", "to", "use", "using", "versus", "want", "what", "when", "where",
+    "which", "who", "why", "with",
 }
 TUNING_INTENT_TOKENS = {
     "benchmark", "benchmarking", "benchmarked", "benchmarks", "config", "configure",
@@ -54,6 +55,9 @@ REFERENCE_ARCHITECTURE_INTENT_TOKENS = {
 }
 TUTORIAL_INTENT_TOKENS = {
     "how", "install", "migration", "migrate", "port", "porting", "setup", "tutorial",
+}
+INSTALL_INTENT_TOKENS = {
+    "install", "installation",
 }
 SUPPORT_INTENT_TOKENS = {
     "available", "availability", "capable", "capabilities", "capability", "compatible",
@@ -95,6 +99,32 @@ def tokenize_url_for_search(text: str) -> List[str]:
         tokens.append(token)
         if TOKEN_SPLIT_PATTERN.search(token):
             tokens.extend(part for part in TOKEN_SPLIT_PATTERN.split(token) if part)
+            compact_token = TOKEN_SPLIT_PATTERN.sub("", token)
+            if compact_token:
+                tokens.append(compact_token)
+    return tokens
+
+
+def tokenize_url_content_for_search(text: str) -> List[str]:
+    parsed = urlparse(text or "")
+    return tokenize_url_for_search(" ".join((parsed.path, parsed.query, parsed.fragment)))
+
+
+def _normalized_doc_type(doc_type: str) -> str:
+    normalized = (doc_type or "").strip().lower()
+    return {
+        "install guides": "install guide",
+        "learning paths": "learning path",
+    }.get(normalized, normalized)
+
+
+def _dashboard_package_tokens(metadata: Dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for field in ("url", "resolved_url"):
+        parsed = urlparse(metadata.get(field, "") or "")
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.lower() == "package":
+                tokens.update(tokenize_url_for_search(value))
     return tokens
 
 
@@ -252,11 +282,51 @@ def lexical_prepass_search(
     return pinned
 
 
-def build_bm25_index(metadata: List[Dict]) -> Optional[BM25Okapi]:
-    corpus = [tokenize_for_search(item.get("search_text", "")) for item in metadata]
+class ParentAwareBM25:
+    """Expose parent-level BM25 scores in vector-metadata index space."""
+
+    def __init__(self, corpus: List[List[str]], metadata_indices: List[int], metadata_count: int):
+        self.index = BM25Okapi(corpus)
+        self.metadata_indices = np.asarray(metadata_indices, dtype=int)
+        self.metadata_count = metadata_count
+
+    def get_scores(self, tokens: List[str]) -> np.ndarray:
+        scores = np.zeros(self.metadata_count, dtype=float)
+        scores[self.metadata_indices] = self.index.get_scores(tokens)
+        return scores
+
+
+def _sparse_document_tokens(metadata: Dict[str, Any]) -> List[str]:
+    tokens = tokenize_for_search(metadata.get("search_text", ""))
+    for field in ("url", "resolved_url"):
+        parsed = urlparse(str(metadata.get(field, "")))
+        for token in tokenize_for_search(" ".join((parsed.path, parsed.query, parsed.fragment))):
+            if TOKEN_SPLIT_PATTERN.search(token):
+                compact_alias = TOKEN_SPLIT_PATTERN.sub("", token)
+                if compact_alias:
+                    tokens.append(compact_alias)
+    return tokens
+
+
+def build_bm25_index(metadata: List[Dict]) -> Optional[ParentAwareBM25]:
+    corpus = []
+    metadata_indices = []
+    seen_parents: set[str] = set()
+    for index, item in enumerate(metadata):
+        parent_key = _parent_chunk_key(item)
+        if parent_key and parent_key in seen_parents:
+            continue
+        if parent_key:
+            seen_parents.add(parent_key)
+        corpus.append(_sparse_document_tokens(item))
+        metadata_indices.append(index)
     if not any(corpus):
         return None
-    return BM25Okapi(corpus)
+    return ParentAwareBM25(corpus, metadata_indices, len(metadata))
+
+
+def _parent_chunk_key(metadata: Dict[str, Any]) -> str:
+    return str(metadata.get("parent_chunk_uuid") or metadata.get("chunk_uuid") or "")
 
 
 def embedding_search(
@@ -270,39 +340,59 @@ def embedding_search(
     if usearch_index is None:
         return []
     query_embedding = embedding_model.encode([query])[0]
-    matches = usearch_index.search(query_embedding, k)
     results: List[Dict[str, Any]] = []
-    if matches is None:
-        return results
-
-    try:
-        labels = getattr(matches, "keys", None)
-        distances = getattr(matches, "distances", None)
-        if labels is None or distances is None:
-            if isinstance(matches, tuple) and len(matches) == 2:
-                labels, distances = matches
-            elif isinstance(matches, dict):
-                labels = matches.get("labels", matches.get("indices"))
-                distances = matches.get("distances")
-        if labels is None or distances is None:
+    raw_depth = min(len(metadata), max(k, k * 2))
+    while raw_depth:
+        matches = usearch_index.search(query_embedding, raw_depth)
+        if matches is None:
             return results
 
-        labels = np.atleast_1d(labels)
-        distances = np.atleast_1d(distances)
-        for rank, (idx, dist) in enumerate(zip(labels, distances), start=1):
-            if idx == -1:
-                continue
-            distance = float(dist)
-            if distance < DISTANCE_THRESHOLD:
+        try:
+            labels = getattr(matches, "keys", None)
+            distances = getattr(matches, "distances", None)
+            if labels is None or distances is None:
+                if isinstance(matches, tuple) and len(matches) == 2:
+                    labels, distances = matches
+                elif isinstance(matches, dict):
+                    labels = matches.get("labels", matches.get("indices"))
+                    distances = matches.get("distances")
+            if labels is None or distances is None:
+                return results
+
+            labels = np.atleast_1d(labels)
+            distances = np.atleast_1d(distances)
+            results = []
+            seen_parents: set[str] = set()
+            for raw_rank, (idx, dist) in enumerate(zip(labels, distances), start=1):
+                if idx == -1:
+                    continue
+                distance = float(dist)
+                if distance >= DISTANCE_THRESHOLD:
+                    break
+                item_metadata = metadata[int(idx)]
+                parent_key = _parent_chunk_key(item_metadata)
+                if parent_key and parent_key in seen_parents:
+                    continue
+                if parent_key:
+                    seen_parents.add(parent_key)
                 results.append(
                     {
-                        "rank": rank,
+                        "rank": len(results) + 1,
+                        "raw_rank": raw_rank,
                         "distance": distance,
-                        "metadata": metadata[int(idx)],
+                        "metadata": item_metadata,
                     }
                 )
-    except Exception as exc:
-        print(f"Error processing dense matches: {exc}")
+                if len(results) == k:
+                    return results
+
+            last_distance = float(distances[-1]) if len(distances) else DISTANCE_THRESHOLD
+            if raw_depth >= len(metadata) or last_distance >= DISTANCE_THRESHOLD:
+                return results
+            raw_depth = min(len(metadata), raw_depth * 2)
+        except Exception as exc:
+            print(f"Error processing dense matches: {exc}")
+            return results
     return results
 
 
@@ -320,17 +410,27 @@ def bm25_search(
     scores = bm25_index.get_scores(tokens)
     ranking = np.argsort(scores)[::-1]
     results: List[Dict[str, Any]] = []
-    for rank, idx in enumerate(ranking[:k], start=1):
+    seen_parents: set[str] = set()
+    for raw_rank, idx in enumerate(ranking, start=1):
         score = float(scores[idx])
         if score <= 0:
+            break
+        item_metadata = metadata[int(idx)]
+        parent_key = _parent_chunk_key(item_metadata)
+        if parent_key and parent_key in seen_parents:
             continue
+        if parent_key:
+            seen_parents.add(parent_key)
         results.append(
             {
-                "rank": rank,
+                "rank": len(results) + 1,
+                "raw_rank": raw_rank,
                 "bm25_score": score,
-                "metadata": metadata[int(idx)],
+                "metadata": item_metadata,
             }
         )
+        if len(results) == k:
+            break
     return results
 
 
@@ -375,6 +475,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
     prefers_tuning_guide = bool(query_tokens & TUNING_INTENT_TOKENS)
     prefers_reference_architecture = bool(query_tokens & REFERENCE_ARCHITECTURE_INTENT_TOKENS)
     prefers_tutorial = bool(query_tokens & TUTORIAL_INTENT_TOKENS)
+    asks_for_learning_path = "lp" in query_tokens or {"learning", "path"}.issubset(query_tokens)
 
     reranked: List[Dict[str, Any]] = []
     for candidate in candidates:
@@ -383,16 +484,23 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         title_text = _metadata_text(metadata, ("title",))
         heading_text = _metadata_text(metadata, ("heading", "heading_path"))
         url_text = _metadata_text(metadata, ("url", "resolved_url"))
+        source_url = metadata.get("url", "") or ""
         title_tokens = set(tokenize_for_search(title_text))
         heading_tokens = set(tokenize_for_search(heading_text))
-        url_tokens = set(tokenize_url_for_search(url_text))
-        resolved_url_tokens = set(tokenize_url_for_search(metadata.get("resolved_url", "")))
+        url_tokens = set(tokenize_url_content_for_search(source_url))
+        resolved_url_tokens = set(tokenize_url_content_for_search(metadata.get("resolved_url", "")))
         title_url_tokens = title_tokens | url_tokens | resolved_url_tokens
-        doc_type = (metadata.get("doc_type", "") or "").strip().lower()
-        source_url = metadata.get("url", "") or ""
+        doc_type = _normalized_doc_type(metadata.get("doc_type", ""))
         provider_doc_bonus = 0.0
         if (query_tokens & PROVIDER_DOCUMENTATION_TOKENS) and doc_type in {"google cloud documentation"}:
             provider_doc_bonus = 0.18
+        dashboard_package_bonus = 0.0
+        if (
+            doc_type == "ecosystem dashboard"
+            and (query_tokens & SUPPORT_INTENT_TOKENS)
+            and (query_tokens & _dashboard_package_tokens(metadata))
+        ):
+            dashboard_package_bonus = 0.30
         parent_learning_path_bonus = 0.0
         support_evidence_bonus = _support_evidence_score(
             query_tokens,
@@ -406,7 +514,10 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         title_url_overlap = _overlap_ratio(scoring_query_tokens, title_url_tokens)
         url_overlap = _overlap_ratio(scoring_query_tokens, url_tokens | resolved_url_tokens)
         if len(scoring_query_tokens) <= 3 and _is_learning_path_root_url(source_url):
-            parent_learning_path_bonus = 0.85 if title_url_overlap >= 0.60 else 0.25
+            if asks_for_learning_path:
+                parent_learning_path_bonus = 0.85 if title_url_overlap >= 0.60 else 0.25
+            elif title_url_overlap >= 0.60:
+                parent_learning_path_bonus = 0.15
 
         entity_overlap = 0.0
         if salient_query_tokens:
@@ -456,53 +567,89 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
             elif "brief" in doc_type:
                 doc_type_bonus -= 0.05
         if prefers_tutorial:
-            if doc_type in {"tutorial", "install guide", "learning path", "learning paths"}:
+            if doc_type in {"tutorial", "install guide", "learning path"}:
                 doc_type_bonus += 0.10
+        if (query_tokens & INSTALL_INTENT_TOKENS) and doc_type == "install guide":
+            doc_type_bonus += 0.25
         if len(scoring_query_tokens) <= 3:
-            rerank_score = (
-                candidate.get("rrf_score", 0.0)
-                + (0.16 * body_overlap)
-                + (0.16 * title_overlap)
-                + (0.08 * heading_overlap)
-                + (0.12 * entity_overlap)
-                + (0.15 * dense_bonus)
-                + (0.12 * sparse_bonus)
-                + (0.25 * lexical_prepass_bonus)
-                + direct_match_bonus
-                + support_evidence_bonus
-                + provider_doc_bonus
-                + parent_learning_path_bonus
-                + doc_type_bonus
-                - shallow_overlap_penalty
-            )
+            scoring_profile = "short_query"
+            contributions = {
+                "reciprocal_rank_fusion": candidate.get("rrf_score", 0.0),
+                "body_overlap": 0.16 * body_overlap,
+                "title_overlap": 0.16 * title_overlap,
+                "heading_overlap": 0.08 * heading_overlap,
+                "entity_overlap": 0.12 * entity_overlap,
+                "dense_similarity": 0.15 * dense_bonus,
+                "bm25": 0.12 * sparse_bonus,
+                "lexical_prepass": 0.25 * lexical_prepass_bonus,
+                "direct_match": direct_match_bonus,
+                "support_evidence": support_evidence_bonus,
+                "provider_documentation": provider_doc_bonus,
+                "dashboard_package_match": dashboard_package_bonus,
+                "parent_learning_path": parent_learning_path_bonus,
+                "document_type": doc_type_bonus,
+                "shallow_overlap_penalty": -shallow_overlap_penalty,
+            }
         else:
+            scoring_profile = "long_query"
             full_query_body_overlap = len(query_tokens & full_text_tokens) / len(query_tokens)
             full_query_title_overlap = len(query_tokens & title_tokens) / len(query_tokens)
             full_query_heading_overlap = len(query_tokens & heading_tokens) / len(query_tokens)
             exact_entity_bonus = 0.0
             if salient_query_tokens and (salient_query_tokens & title_url_tokens):
                 exact_entity_bonus = 0.18
-            rerank_score = (
-                candidate.get("rrf_score", 0.0)
-                + (0.35 * full_query_body_overlap)
-                + (0.20 * full_query_title_overlap)
-                + (0.15 * full_query_heading_overlap)
-                + (0.20 * entity_overlap)
-                + (0.15 * dense_bonus)
-                + (0.15 * sparse_bonus)
-                + (0.35 * lexical_prepass_bonus)
-                + support_evidence_bonus
-                + provider_doc_bonus
-                + exact_entity_bonus
-                + doc_type_bonus
-            )
-        reranked.append({**candidate, "rerank_score": rerank_score})
+            contributions = {
+                "reciprocal_rank_fusion": candidate.get("rrf_score", 0.0),
+                "body_overlap": 0.35 * full_query_body_overlap,
+                "title_overlap": 0.20 * full_query_title_overlap,
+                "heading_overlap": 0.15 * full_query_heading_overlap,
+                "entity_overlap": 0.20 * entity_overlap,
+                "dense_similarity": 0.15 * dense_bonus,
+                "bm25": 0.15 * sparse_bonus,
+                "lexical_prepass": 0.35 * lexical_prepass_bonus,
+                "support_evidence": support_evidence_bonus,
+                "provider_documentation": provider_doc_bonus,
+                "dashboard_package_match": dashboard_package_bonus,
+                "exact_entity": exact_entity_bonus,
+                "document_type": doc_type_bonus,
+            }
+        rerank_score = sum(contributions.values())
+        score_debug = {
+            "scoring_profile": scoring_profile,
+            "query_analysis": {
+                "tokens": sorted(query_tokens),
+                "salient_tokens": sorted(salient_query_tokens),
+                "scoring_tokens": sorted(scoring_query_tokens),
+            },
+            "retrieval": {
+                "dense": {
+                    "rank": candidate.get("dense_rank"),
+                    "raw_window_rank": candidate.get("dense_raw_rank"),
+                    "distance": candidate.get("distance"),
+                    "distance_threshold": DISTANCE_THRESHOLD,
+                },
+                "bm25": {
+                    "rank": candidate.get("bm25_rank"),
+                    "raw_window_rank": candidate.get("bm25_raw_rank"),
+                    "raw_score": candidate.get("bm25_score"),
+                },
+                "lexical_prepass": {
+                    "rank": candidate.get("lexical_prepass_rank"),
+                    "raw_score": candidate.get("lexical_prepass_score"),
+                    "pinned": bool(candidate.get("pinned_lexical")),
+                },
+                "rrf_contributions": candidate.get("rrf_contributions", {}),
+            },
+            "contributions": contributions,
+            "final_score": rerank_score,
+        }
+        reranked.append({**candidate, "rerank_score": rerank_score, "score_debug": score_debug})
     return sorted(reranked, key=lambda item: item["rerank_score"], reverse=True)
 
 
 def _candidate_key(result: Dict[str, Any]) -> str:
     metadata = result.get("metadata", {})
-    chunk_uuid = metadata.get("chunk_uuid")
+    chunk_uuid = metadata.get("parent_chunk_uuid") or metadata.get("chunk_uuid")
     if not chunk_uuid:
         url = metadata.get("url") or metadata.get("resolved_url") or "<unknown url>"
         raise ValueError(f"Search metadata missing required chunk_uuid for {url}")
@@ -536,40 +683,75 @@ def hybrid_search(
     candidates: Dict[str, Dict[str, Any]] = {}
     for result in lexical_results:
         candidate_key = _candidate_key(result)
+        lexical_rrf = 1 / (RRF_K + result["lexical_prepass_rank"])
         candidates[candidate_key] = {
             **result,
-            "rrf_score": 1 / (RRF_K + result["lexical_prepass_rank"]),
+            "rrf_score": lexical_rrf,
+            "rrf_contributions": {"lexical_prepass": lexical_rrf},
         }
 
     for result in dense_results:
         candidate_key = _candidate_key(result)
         existing = candidates.get(candidate_key, {"metadata": result["metadata"], "rrf_score": 0.0})
         existing["rank"] = min(existing.get("rank", result["rank"]), result["rank"])
+        existing["dense_rank"] = result["rank"]
+        existing["dense_raw_rank"] = result.get("raw_rank", result["rank"])
         existing["distance"] = result["distance"]
-        existing["rrf_score"] += 1 / (RRF_K + result["rank"])
+        dense_rrf = 1 / (RRF_K + result["rank"])
+        existing["rrf_score"] += dense_rrf
+        existing.setdefault("rrf_contributions", {})["dense"] = dense_rrf
         candidates[candidate_key] = existing
 
     for result in sparse_results:
         candidate_key = _candidate_key(result)
         existing = candidates.get(candidate_key, {"metadata": result["metadata"], "rrf_score": 0.0})
         existing["rank"] = min(existing.get("rank", result["rank"]), result["rank"])
+        existing["bm25_rank"] = result["rank"]
+        existing["bm25_raw_rank"] = result.get("raw_rank", result["rank"])
         existing["bm25_score"] = result["bm25_score"]
-        existing["rrf_score"] += 1 / (RRF_K + result["rank"])
+        bm25_rrf = 1 / (RRF_K + result["rank"])
+        existing["rrf_score"] += bm25_rrf
+        existing.setdefault("rrf_contributions", {})["bm25"] = bm25_rrf
         candidates[candidate_key] = existing
 
     combined = rerank_candidates(query, list(candidates.values()))
+    pipeline_debug = {
+        "candidate_depth": candidate_depth,
+        "lexical_candidates": len(lexical_results),
+        "dense_candidates": len(dense_results),
+        "bm25_candidates": len(sparse_results),
+        "fused_candidates": len(candidates),
+    }
+    for rank, result in enumerate(combined, start=1):
+        result["score_debug"]["pre_dedup_rank"] = rank
+        result["score_debug"]["pipeline"] = pipeline_debug
     return combined[:k]
 
 
 def deduplicate_urls(results: List[Dict[str, Any]], max_chunks_per_url: int = 1) -> List[Dict[str, Any]]:
-    """Keep the highest-ranked chunk for each URL by default."""
+    """Keep the highest-ranked chunk for each canonical page by default."""
     seen_counts: Dict[str, int] = {}
     deduplicated_results = []
     for item in results:
-        url = item["metadata"].get("url")
+        metadata = item["metadata"]
+        url = metadata.get("resolved_url") or metadata.get("url")
         if not url:
             continue
-        seen_counts[url] = seen_counts.get(url, 0) + 1
-        if seen_counts[url] <= max_chunks_per_url:
+        parsed = urlparse(url)
+        query = urlencode(sorted([
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() != "utm_source"
+        ]))
+        semantic_fragment = parsed.fragment if "=" in parsed.fragment else ""
+        page_key = urlunparse(parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
+            path=parsed.path.rstrip("/") or "/",
+            query=query,
+            fragment=semantic_fragment,
+        ))
+        seen_counts[page_key] = seen_counts.get(page_key, 0) + 1
+        if seen_counts[page_key] <= max_chunks_per_url:
             deduplicated_results.append(item)
     return deduplicated_results
