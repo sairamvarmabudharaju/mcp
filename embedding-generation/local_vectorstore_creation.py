@@ -41,7 +41,7 @@ def load_local_yaml_files() -> list[dict]:
     intrinsic_dir = os.getenv("INTRINSIC_CHUNKS_DIR", "intrinsic_chunks")
     yaml_dir = os.getenv("YAML_DATA_DIR", "yaml_data")
 
-    intrinsic_files = glob.glob(os.path.join(intrinsic_dir, "*.yaml"))
+    intrinsic_files = sorted(glob.glob(os.path.join(intrinsic_dir, "*.yaml")))
     print(f"Found {len(intrinsic_files)} YAML files in {intrinsic_dir} directory")
     if not intrinsic_files:
         raise FileNotFoundError(
@@ -49,7 +49,7 @@ def load_local_yaml_files() -> list[dict]:
             "Supply the intrinsic chunks before creating the vector store."
         )
 
-    yaml_data_files = glob.glob(os.path.join(yaml_dir, "*.yaml"))
+    yaml_data_files = sorted(glob.glob(os.path.join(yaml_dir, "*.yaml")))
     print(f"Found {len(yaml_data_files)} YAML files in {yaml_dir} directory")
 
     # Combine all files
@@ -143,15 +143,24 @@ def _window_spans(
 
     spans = []
     start_token = 0
+    covered_end_token = 0
     while start_token < len(offsets):
         end_token = min(len(offsets), start_token + max_tokens)
         if end_token < len(offsets):
             word_start = _word_start(offsets, end_token)
-            if word_start > start_token:
+            # Prefer a word boundary only if doing so still extends coverage.
+            # A long sub-word-tokenized word can otherwise make many later
+            # windows backtrack to the same end and embed no new content.
+            if word_start > max(start_token, covered_end_token):
                 end_token = word_start
+        if end_token <= covered_end_token:
+            # Splitting an oversized word is better than emitting a redundant
+            # window or stalling before the word's remaining pieces.
+            end_token = min(len(offsets), max(covered_end_token + 1, start_token + max_tokens))
         start_char = 0 if start_token == 0 else offsets[start_token][0]
         end_char = len(text) if end_token == len(offsets) else offsets[end_token][0]
         spans.append((start_char, end_char))
+        covered_end_token = end_token
         if end_token == len(offsets):
             break
         next_start = _word_start(offsets, max(end_token - overlap_tokens, start_token + 1))
@@ -203,6 +212,23 @@ def _metadata_for_window(
     parent_content_length: int,
     embedding_token_count: int,
 ) -> dict:
+    window_reference = {
+        "chunk_uuid": chunk_uuid,
+        "parent_chunk_uuid": parent_chunk_uuid,
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "content_start_char": content_start_char,
+        "content_end_char": content_end_char,
+        "parent_content_length": parent_content_length,
+        "embedding_token_count": embedding_token_count,
+    }
+    if chunk_index != 1:
+        # Dense retrieval only needs enough information to resolve this vector
+        # to the first (representative) row. Keeping the parent text and all of
+        # its lexical fields on every child duplicates tens of megabytes and
+        # those fields are never scored or returned.
+        return window_reference
+
     heading_path = yaml_content.get("heading_path", []) or []
     search_text = " ".join(
         str(value)
@@ -225,14 +251,7 @@ def _metadata_for_window(
         "original_text": original_text,
         "title": yaml_content["title"],
         "keywords": yaml_content["keywords"],
-        "chunk_uuid": chunk_uuid,
-        "parent_chunk_uuid": parent_chunk_uuid,
-        "chunk_index": chunk_index,
-        "chunk_count": chunk_count,
-        "content_start_char": content_start_char,
-        "content_end_char": content_end_char,
-        "parent_content_length": parent_content_length,
-        "embedding_token_count": embedding_token_count,
+        **window_reference,
         "heading": yaml_content.get("heading", ""),
         "heading_path": heading_path,
         "doc_type": yaml_content.get("doc_type", ""),
@@ -249,29 +268,40 @@ def _fit_embedding_text(
     separator: str,
     body_window: str,
     max_seq_length: int,
-) -> tuple[str, int, bool]:
-    """Return the embedding text for a window, trimmed if re-tokenising it overflowed.
+) -> tuple[str, int, str, bool]:
+    """Return the longest prefix of a window that fits after adding context.
 
     Windows are budgeted with a safety margin, but joining the context and the
-    window can tokenise differently at the seam. Trimming a few trailing tokens
-    is preferable to failing a corpus-wide build; the overlap with the next
-    window covers the trimmed text except for the final window of a chunk.
+    window can tokenise differently at the seam. Retrying shorter prefixes
+    guarantees the returned input actually fits. The caller verifies that
+    overlapping fitted windows still cover the full parent body, so trimming
+    can never silently lose content.
     """
-    embedding_text = f"{context}{separator}{body_window}"
-    token_count = len(
-        tokenizer(embedding_text, add_special_tokens=True, truncation=False, padding=False)["input_ids"]
-    )
+    def render(window: str) -> tuple[str, int]:
+        embedding_text = f"{context}{separator}{window}"
+        token_count = len(
+            tokenizer(
+                embedding_text,
+                add_special_tokens=True,
+                truncation=False,
+                padding=False,
+            )["input_ids"]
+        )
+        return embedding_text, token_count
+
+    embedding_text, token_count = render(body_window)
     if token_count <= max_seq_length:
-        return embedding_text, token_count, False
-    overflow = token_count - max_seq_length
+        return embedding_text, token_count, body_window, False
+
     window_offsets = _token_offsets(tokenizer, body_window)
-    keep_tokens = max(1, len(window_offsets) - overflow)
-    trimmed_window = _truncate_to_tokens(tokenizer, body_window, keep_tokens)
-    embedding_text = f"{context}{separator}{trimmed_window}"
-    token_count = len(
-        tokenizer(embedding_text, add_special_tokens=True, truncation=False, padding=False)["input_ids"]
-    )
-    return embedding_text, token_count, True
+    for keep_tokens in range(len(window_offsets) - 1, -1, -1):
+        trimmed_window = (
+            "" if keep_tokens == 0 else body_window[: window_offsets[keep_tokens - 1][1]]
+        )
+        candidate_text, candidate_count = render(trimmed_window)
+        if candidate_count <= max_seq_length:
+            return candidate_text, candidate_count, trimmed_window, True
+    raise ValueError("Embedding context alone exceeds the model token limit")
 
 
 def prepare_embedding_records(
@@ -283,10 +313,10 @@ def prepare_embedding_records(
     """Create lossless overlapping windows that fit the embedding model.
 
     Every window becomes one vector. The first window of a chunk carries the
-    chunk's full text in ``original_text`` and ``search_text``; later windows
-    carry only their slice. The server groups windows by ``parent_chunk_uuid``
-    and scores and displays each parent through its first window, so search
-    results still return the whole chunk.
+    chunk's full display text and lexical search text. Later windows carry only
+    a compact reference to that representative row. The server groups windows
+    by ``parent_chunk_uuid`` and scores and displays each parent through its
+    first window, so search results still return the whole chunk.
     """
     special_tokens = tokenizer.num_special_tokens_to_add(pair=False)
     contents = []
@@ -311,14 +341,58 @@ def prepare_embedding_records(
             - context_token_count
             - EMBEDDING_TOKEN_SAFETY_MARGIN
         )
-        spans = _window_spans(tokenizer, body, body_budget, overlap_tokens)
         parent_chunk_uuid = yaml_content["chunk_uuid"]
-        chunk_count = len(spans)
-        for chunk_index, (start_char, end_char) in enumerate(spans, start=1):
-            body_window = body[start_char:end_char]
-            embedding_text, embedding_token_count, trimmed = _fit_embedding_text(
-                tokenizer, context, separator, body_window, max_seq_length
-            )
+        while True:
+            spans = _window_spans(tokenizer, body, body_budget, overlap_tokens)
+            fitted_windows = []
+            covered_end_char = 0
+            budget_reduction = 0
+            coverage_is_lossless = True
+            for start_char, end_char in spans:
+                body_window = body[start_char:end_char]
+                embedding_text, embedding_token_count, fitted_body_window, trimmed = (
+                    _fit_embedding_text(
+                        tokenizer, context, separator, body_window, max_seq_length
+                    )
+                )
+                fitted_end_char = start_char + len(fitted_body_window)
+                if trimmed:
+                    budget_reduction = max(
+                        budget_reduction,
+                        len(_token_offsets(tokenizer, body_window))
+                        - len(_token_offsets(tokenizer, fitted_body_window)),
+                    )
+                if start_char > covered_end_char or (
+                    body and fitted_end_char <= covered_end_char
+                ):
+                    coverage_is_lossless = False
+                    break
+                covered_end_char = fitted_end_char
+                fitted_windows.append(
+                    (
+                        start_char,
+                        fitted_end_char,
+                        embedding_text,
+                        embedding_token_count,
+                        trimmed,
+                    )
+                )
+            if coverage_is_lossless and covered_end_char == len(body):
+                break
+            body_budget -= max(1, budget_reduction)
+            if body_budget <= overlap_tokens:
+                raise ValueError(
+                    f"Unable to create lossless embedding windows for {parent_chunk_uuid}"
+                )
+
+        chunk_count = len(fitted_windows)
+        for chunk_index, (
+            start_char,
+            fitted_end_char,
+            embedding_text,
+            embedding_token_count,
+            trimmed,
+        ) in enumerate(fitted_windows, start=1):
             if trimmed:
                 trimmed_windows += 1
                 print(
@@ -328,19 +402,20 @@ def prepare_embedding_records(
             chunk_uuid = parent_chunk_uuid
             if chunk_count > 1:
                 chunk_uuid = f"{parent_chunk_uuid}__window_{chunk_index}_of_{chunk_count}"
-            window_text = source_content if chunk_index == 1 else body_window
+            original_text = source_content if chunk_index == 1 else ""
+            search_text_content = source_content if chunk_index == 1 else ""
             contents.append(embedding_text)
             metadata.append(
                 _metadata_for_window(
                     yaml_content,
-                    window_text,
-                    window_text,
+                    original_text,
+                    search_text_content,
                     chunk_uuid,
                     parent_chunk_uuid,
                     chunk_index,
                     chunk_count,
                     start_char,
-                    end_char,
+                    fitted_end_char,
                     len(body),
                     embedding_token_count,
                 )

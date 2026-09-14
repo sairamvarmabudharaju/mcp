@@ -17,6 +17,7 @@ import re
 import pytest
 
 from local_vectorstore_creation import (
+    _fit_embedding_text,
     _window_spans,
     load_local_yaml_files,
     prepare_embedding_records,
@@ -63,6 +64,16 @@ class SeamTokenizer(WhitespaceTokenizer):
         return result
 
 
+class NonlinearSeamTokenizer(WhitespaceTokenizer):
+    """Adds a join penalty large enough that subtracting overflow once is insufficient."""
+
+    def __call__(self, text, add_special_tokens=True, **kwargs):
+        result = super().__call__(text, add_special_tokens=add_special_tokens, **kwargs)
+        if add_special_tokens and "\n\n" in text:
+            result["input_ids"] += [0] * (len(result["input_ids"]) // 2)
+        return result
+
+
 def _source(body: str, **overrides) -> dict:
     return {
         "uuid": "source",
@@ -98,8 +109,8 @@ def test_prepare_embedding_records_preserves_body_with_overlap():
     assert metadata[-1]["content_end_char"] == len(body)
     for index in range(len(metadata) - 1):
         assert metadata[index]["content_end_char"] > metadata[index + 1]["content_start_char"]
-    windows = " ".join(item["original_text"] for item in metadata[1:]) + metadata[0]["original_text"]
-    assert all(word in windows for word in body.split())
+    embedded_bodies = " ".join(content.split("\n\n", 1)[-1] for content in contents)
+    assert all(word in embedded_bodies for word in body.split())
 
 
 def test_first_window_carries_the_full_source_text():
@@ -111,8 +122,10 @@ def test_first_window_carries_the_full_source_text():
     assert metadata[0]["chunk_index"] == 1
     assert metadata[0]["original_text"] == source["content"]
     assert body in metadata[0]["search_text"]
-    assert metadata[1]["original_text"] == body[metadata[1]["content_start_char"]:metadata[1]["content_end_char"]]
-    assert body not in metadata[1]["search_text"]
+    assert "original_text" not in metadata[1]
+    assert "search_text" not in metadata[1]
+    assert "url" not in metadata[1]
+    assert metadata[1]["parent_chunk_uuid"] == "chunk"
 
 
 def test_prepare_embedding_records_keeps_short_source_as_one_record():
@@ -150,6 +163,16 @@ def test_single_oversized_word_is_split_without_stalling():
     assert all(later[0] > earlier[0] for earlier, later in zip(spans, spans[1:]))
 
 
+def test_every_window_extends_coverage_past_a_long_word_boundary():
+    text = " ".join([*("prefix" for _ in range(45)), "x" * 600, "suffix"])
+
+    spans = _window_spans(PieceTokenizer(), text, max_tokens=32, overlap_tokens=8)
+
+    assert spans[0][0] == 0 and spans[-1][1] == len(text)
+    assert all(end > previous_end for (_, previous_end), (_, end) in zip(spans, spans[1:]))
+    assert all(text[start:end] for start, end in spans)
+
+
 def test_embedding_context_includes_the_full_heading_path():
     source = _source("short body", heading_path=["Getting started", "Install"])
 
@@ -158,10 +181,30 @@ def test_embedding_context_includes_the_full_heading_path():
     assert contents[0].startswith("Example\nGetting started > Install\n\n")
 
 
-def test_overflowing_window_is_trimmed_instead_of_failing(capsys):
+def test_overflowing_window_retries_with_a_lossless_budget():
     body = " ".join(f"word{index}" for index in range(30))
 
     _, metadata = prepare_embedding_records([_source(body)], SeamTokenizer(), max_seq_length=12, overlap_tokens=2)
 
     assert all(item["embedding_token_count"] <= 12 for item in metadata)
-    assert "Trimmed" in capsys.readouterr().out
+    assert metadata[0]["content_start_char"] == 0
+    assert metadata[-1]["content_end_char"] == len(body)
+    assert all(
+        current["content_start_char"] <= previous["content_end_char"]
+        for previous, current in zip(metadata, metadata[1:])
+    )
+
+
+def test_embedding_fit_rechecks_nonlinear_seam_overflow():
+    embedding_text, token_count, fitted_body, trimmed = _fit_embedding_text(
+        NonlinearSeamTokenizer(),
+        "Example",
+        "\n\n",
+        " ".join(f"word{index}" for index in range(20)),
+        max_seq_length=12,
+    )
+
+    assert trimmed
+    assert fitted_body
+    assert fitted_body in embedding_text
+    assert token_count <= 12
