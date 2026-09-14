@@ -15,6 +15,7 @@
 """Validation tests for vector-db-sources.csv."""
 
 import csv
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -79,6 +80,20 @@ def test_vector_db_source_urls_are_http_urls():
         "Rows in vector-db-sources.csv have invalid URL values:\n"
         + "\n".join(invalid_urls)
     )
+
+
+def test_vector_db_source_urls_are_unique():
+    """Each canonical source URL should be represented by exactly one row."""
+    with SOURCES_FILE.open(newline="", encoding="utf-8") as sources:
+        reader = csv.DictReader(sources)
+        url_counts = Counter(
+            (row.get("URL") or "").strip()
+            for row in reader
+            if (row.get("URL") or "").strip()
+        )
+    duplicates = sorted(url for url, count in url_counts.items() if count > 1)
+
+    assert not duplicates, "Duplicate source URLs:\n" + "\n".join(duplicates)
 
 
 def test_vector_db_sources_have_keywords():
