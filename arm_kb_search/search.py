@@ -27,11 +27,15 @@ from .config import DENSE_SEARCH_EXACT, DISTANCE_THRESHOLD, K_RESULTS
 
 SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_\-+.]*", re.IGNORECASE)
 TOKEN_SPLIT_PATTERN = re.compile(r"[_\-+.]+")
+CAMEL_CASE_BOUNDARY_PATTERN = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
 RRF_K = 60
 LEXICAL_PREPASS_DEPTH = 400
 PINNED_LEXICAL_CANDIDATES = 20
 DEDUPLICATION_CANDIDATE_MULTIPLIER = 10
 MIN_DEDUPLICATION_CANDIDATES = 50
+MAX_RESULTS_PER_LEARNING_PATH = 2
 SEARCH_STOPWORDS = {
     "a", "an", "and", "are", "be", "better", "can", "configured", "configuration", "for",
     "called", "do", "does", "how", "i", "improve", "in", "is", "it", "of", "on", "or", "out",
@@ -41,10 +45,10 @@ SEARCH_STOPWORDS = {
     "options", "performance", "processor", "processors", "reference", "setup", "tutorial",
 }
 DIRECT_INTENT_STOPWORDS = {
-    "a", "about", "an", "and", "are", "arm", "as", "be", "best", "both", "by", "can", "do",
+    "a", "about", "an", "and", "app", "application", "are", "arm", "as", "based", "be", "best", "both", "by", "can", "do",
     "does", "for", "from", "get", "give", "how", "i", "in", "into", "is", "it", "learn",
-    "learning", "lp", "me", "my", "new", "of", "on", "or", "path", "run", "same", "should",
-    "that", "the", "them", "to", "use", "using", "versus", "want", "what", "when", "where",
+    "instance", "learning", "lp", "me", "model", "my", "new", "of", "on", "or", "path", "phone", "run", "same",
+    "set", "setup", "should", "that", "the", "them", "to", "up", "use", "using", "versus", "want", "web", "what", "when", "where",
     "which", "who", "why", "with",
 }
 TUNING_INTENT_TOKENS = {
@@ -59,15 +63,12 @@ TUTORIAL_INTENT_TOKENS = {
     "how", "install", "migration", "migrate", "port", "porting", "setup", "tutorial",
 }
 INSTALL_INTENT_TOKENS = {
-    "install", "installation",
+    "install", "installation", "setup",
 }
 SUPPORT_INTENT_TOKENS = {
     "available", "availability", "capable", "capabilities", "capability", "compatible",
     "compatibility", "device", "devices", "hardware", "processor", "processors", "server",
     "servers", "support", "supported", "supporting", "supports",
-}
-PROVIDER_DOCUMENTATION_TOKENS = {
-    "autopilot", "compute", "engine", "gcp", "gke", "google", "kubernetes",
 }
 COMPILER_GUIDE_TOKENS = {
     "compiler", "compilers", "gcc", "llvm", "clang",
@@ -85,11 +86,31 @@ GENERIC_ENTITY_TOKENS = (
     | INSTALL_INTENT_TOKENS
     | TUTORIAL_INTENT_TOKENS
     | PLATFORM_TOKENS
-    | {"guide", "guides"}
+    | {"app", "application", "guide", "guides", "instance", "model", "phone", "web"}
 )
+ALIAS_NOISE_TOKENS = {
+    "and", "document", "documentation", "for", "guide", "guides", "heading",
+    "how", "install", "installation", "learning", "on", "path", "the", "title",
+    "to", "tutorial", "with",
+}
+MAX_ALIAS_PHRASE_TOKENS = 4
+QUERY_PHRASE_CANONICALIZATIONS = {
+    ("set", "up"): ("setup",),
+}
 VERSIONED_CAPABILITY_PREFIXES = {
     "sme",
     "sve",
+}
+CONTEXT_TOKEN_GROUPS = {
+    "server_cloud": {"cloud", "datacenter", "server", "servers"},
+    "mobile": {"android", "mobile", "phone", "phones"},
+    "embedded": {"embedded", "microcontroller", "microcontrollers", "mcu"},
+    "desktop": {"desktop", "desktops", "laptop", "laptops"},
+}
+CONFLICTING_CONTEXT_GROUPS = {
+    "server_cloud": {"mobile", "embedded"},
+    "mobile": {"server_cloud"},
+    "embedded": {"server_cloud"},
 }
 NEGATIVE_SUPPORT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -106,8 +127,146 @@ NEGATIVE_SUPPORT_PATTERNS = tuple(
 )
 
 
+def _split_identifier_token(token: str) -> List[str]:
+    with_camel_boundaries = CAMEL_CASE_BOUNDARY_PATTERN.sub(" ", token or "")
+    return [
+        part.lower()
+        for part in re.split(r"[_\-+.\s]+", with_camel_boundaries)
+        if part
+    ]
+
+
+def _identifier_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    for token in SEARCH_TOKEN_PATTERN.findall(text or ""):
+        tokens.extend(_split_identifier_token(token))
+    return tokens
+
+
+def _add_alias_phrases(
+    aliases: Dict[str, set[tuple[str, ...]]], tokens: List[str]
+) -> None:
+    for width in range(2, min(MAX_ALIAS_PHRASE_TOKENS, len(tokens)) + 1):
+        for start in range(len(tokens) - width + 1):
+            phrase = tuple(tokens[start:start + width])
+            if any(token in ALIAS_NOISE_TOKENS or len(token) < 2 for token in phrase):
+                continue
+            compact = "".join(phrase)
+            if len(compact) < 5:
+                continue
+            aliases.setdefault(compact, set()).add(phrase)
+
+
+def build_query_aliases(metadata: List[Dict[str, Any]]) -> Dict[str, tuple[str, ...]]:
+    """Build unambiguous compact-name expansions from corpus metadata."""
+    candidates: Dict[str, set[tuple[str, ...]]] = {}
+    seen_text_values: set[str] = set()
+    seen_url_segments: set[str] = set()
+
+    for item in metadata:
+        for field in ("title", "product", "keywords"):
+            value = item.get(field)
+            values = value if isinstance(value, list) else [value]
+            for raw_value in values:
+                if not raw_value:
+                    continue
+                for phrase_text in re.split(r"[;,|]", str(raw_value)):
+                    phrase_text = phrase_text.strip()
+                    if not phrase_text or phrase_text in seen_text_values:
+                        continue
+                    seen_text_values.add(phrase_text)
+                    _add_alias_phrases(candidates, _identifier_tokens(phrase_text))
+
+        for field in ("url", "resolved_url"):
+            parsed = urlparse(str(item.get(field, "") or ""))
+            for segment in parsed.path.split("/"):
+                if not segment or segment in seen_url_segments:
+                    continue
+                seen_url_segments.add(segment)
+                segment_tokens = _split_identifier_token(segment)
+                if len(segment_tokens) >= 2:
+                    _add_alias_phrases(candidates, segment_tokens)
+
+    return {
+        compact: next(iter(expansions))
+        for compact, expansions in candidates.items()
+        if len(expansions) == 1
+    }
+
+
+def _canonicalize_query_phrases(tokens: List[str]) -> List[str]:
+    canonical: List[str] = []
+    position = 0
+    while position < len(tokens):
+        matched = False
+        for phrase, replacement in QUERY_PHRASE_CANONICALIZATIONS.items():
+            if tuple(tokens[position:position + len(phrase)]) != phrase:
+                continue
+            canonical.extend(replacement)
+            position += len(phrase)
+            matched = True
+            break
+        if not matched:
+            canonical.append(tokens[position])
+            position += 1
+    return canonical
+
+
+def normalize_query_for_search(
+    query: str, aliases: Dict[str, tuple[str, ...]]
+) -> str:
+    """Add canonical boundaries and aliases without discarding exact identifiers."""
+    expanded_tokens: List[str] = []
+    for raw_token in SEARCH_TOKEN_PATTERN.findall(query or ""):
+        token = raw_token.lower()
+        boundary_parts = _split_identifier_token(raw_token)
+        if boundary_parts != [token]:
+            preserve_exact = bool(
+                CAMEL_CASE_BOUNDARY_PATTERN.search(raw_token)
+                or re.search(r"[_+.]", raw_token)
+                or any(character.isdigit() for character in raw_token)
+            )
+            if preserve_exact:
+                expanded_tokens.append(token)
+            expanded_tokens.extend(boundary_parts)
+            continue
+        expanded_tokens.append(token)
+        alias_parts = aliases.get(TOKEN_SPLIT_PATTERN.sub("", token))
+        if alias_parts:
+            expanded_tokens.extend(alias_parts)
+
+    normalized_tokens: List[str] = []
+    for token in _canonicalize_query_phrases(expanded_tokens):
+        if token not in normalized_tokens:
+            normalized_tokens.append(token)
+    return " ".join(normalized_tokens)
+
+
+def _is_google_provider_query(query_tokens: set[str]) -> bool:
+    return bool(
+        query_tokens & {"autopilot", "gcp", "gke"}
+        or {"google", "cloud"}.issubset(query_tokens)
+        or {"compute", "engine"}.issubset(query_tokens)
+    )
+
+
 def tokenize_for_search(text: str) -> List[str]:
     return [token.lower() for token in SEARCH_TOKEN_PATTERN.findall(text or "")]
+
+
+def tokenize_identifier_variants_for_search(text: str) -> List[str]:
+    """Keep exact technical tokens and add their safe boundary variants."""
+    tokens: List[str] = []
+    for raw_token in SEARCH_TOKEN_PATTERN.findall(text or ""):
+        token = raw_token.lower()
+        tokens.append(token)
+        boundary_parts = _split_identifier_token(raw_token)
+        if boundary_parts != [token]:
+            tokens.extend(boundary_parts)
+        compact_token = TOKEN_SPLIT_PATTERN.sub("", token)
+        if compact_token and compact_token != token:
+            tokens.append(compact_token)
+    return tokens
 
 
 def tokenize_url_for_search(text: str) -> List[str]:
@@ -222,6 +381,26 @@ def _support_evidence_score(query_tokens: set[str], text_tokens: set[str], text:
     return score
 
 
+def _context_alignment_score(query_tokens: set[str], document_tokens: set[str]) -> float:
+    """Reward explicit platform agreement and penalize clear platform conflicts."""
+    query_groups = {
+        name for name, tokens in CONTEXT_TOKEN_GROUPS.items() if query_tokens & tokens
+    }
+    if not query_groups:
+        return 0.0
+    document_groups = {
+        name for name, tokens in CONTEXT_TOKEN_GROUPS.items() if document_tokens & tokens
+    }
+    matching_groups = query_groups & document_groups
+    conflicting_groups = {
+        conflict
+        for query_group in query_groups
+        for conflict in CONFLICTING_CONTEXT_GROUPS.get(query_group, set())
+    }
+    conflicts = (document_groups & conflicting_groups) - query_groups
+    return min(0.20, 0.14 * len(matching_groups)) - min(0.20, 0.12 * len(conflicts))
+
+
 
 def _lexical_prepass_score(query: str, metadata: Dict[str, Any], bm25_score: float) -> float:
     query_tokens = set(tokenize_for_search(query))
@@ -320,6 +499,16 @@ class ParentAwareBM25:
 
 def _sparse_document_tokens(metadata: Dict[str, Any]) -> List[str]:
     tokens = tokenize_for_search(metadata.get("search_text", ""))
+    seen_tokens = set(tokens)
+    identifier_text = _metadata_text(
+        metadata,
+        ("title", "heading", "heading_path", "keywords", "product", "url", "resolved_url"),
+    )
+    base_identifier_tokens = set(tokenize_for_search(identifier_text))
+    for token in tokenize_identifier_variants_for_search(identifier_text):
+        if token not in base_identifier_tokens and token not in seen_tokens:
+            tokens.append(token)
+            seen_tokens.add(token)
     for field in ("url", "resolved_url"):
         parsed = urlparse(str(metadata.get(field, "")))
         for token in tokenize_for_search(" ".join((parsed.path, parsed.query, parsed.fragment))):
@@ -331,17 +520,22 @@ def _sparse_document_tokens(metadata: Dict[str, Any]) -> List[str]:
 
 
 def build_bm25_index(metadata: List[Dict]) -> Optional[ParentAwareBM25]:
-    corpus = []
-    metadata_indices = []
-    seen_parents: set[str] = set()
+    representative_indices: Dict[str, int] = {}
+    ungrouped_indices: List[int] = []
     for index, item in enumerate(metadata):
         parent_key = _parent_chunk_key(item)
-        if parent_key and parent_key in seen_parents:
+        if not parent_key:
+            ungrouped_indices.append(index)
             continue
-        if parent_key:
-            seen_parents.add(parent_key)
-        corpus.append(_sparse_document_tokens(item))
-        metadata_indices.append(index)
+        existing_index = representative_indices.get(parent_key)
+        if existing_index is None or (
+            item.get("chunk_index", 1) == 1
+            and metadata[existing_index].get("chunk_index", 1) != 1
+        ):
+            representative_indices[parent_key] = index
+
+    metadata_indices = sorted([*ungrouped_indices, *representative_indices.values()])
+    corpus = [_sparse_document_tokens(metadata[index]) for index in metadata_indices]
     if not any(corpus):
         return None
     return ParentAwareBM25(corpus, metadata_indices, len(metadata))
@@ -531,14 +725,14 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         heading_text = _metadata_text(metadata, ("heading", "heading_path"))
         url_text = _metadata_text(metadata, ("url", "resolved_url"))
         source_url = metadata.get("url", "") or ""
-        title_tokens = set(tokenize_for_search(title_text))
-        heading_tokens = set(tokenize_for_search(heading_text))
+        title_tokens = set(tokenize_identifier_variants_for_search(title_text))
+        heading_tokens = set(tokenize_identifier_variants_for_search(heading_text))
         url_tokens = set(tokenize_url_content_for_search(source_url))
         resolved_url_tokens = set(tokenize_url_content_for_search(metadata.get("resolved_url", "")))
         title_url_tokens = title_tokens | url_tokens | resolved_url_tokens
         doc_type = _normalized_doc_type(metadata.get("doc_type", ""))
         provider_doc_bonus = 0.0
-        if (query_tokens & PROVIDER_DOCUMENTATION_TOKENS) and doc_type in {"google cloud documentation"}:
+        if _is_google_provider_query(query_tokens) and doc_type == "google cloud documentation":
             provider_doc_bonus = 0.18
         dashboard_package_bonus = 0.0
         if (
@@ -552,6 +746,10 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
             query_tokens,
             full_text_tokens | title_tokens | heading_tokens | url_tokens | resolved_url_tokens,
             _metadata_text(metadata, ("search_text", "title", "heading", "heading_path", "url", "resolved_url")),
+        )
+        context_alignment_bonus = _context_alignment_score(
+            query_tokens,
+            title_tokens | heading_tokens | url_tokens | resolved_url_tokens,
         )
 
         body_overlap = _overlap_ratio(scoring_query_tokens, full_text_tokens)
@@ -574,7 +772,10 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         if scoring_query_tokens:
             direct_match_bonus += 0.35 * title_url_overlap
             direct_match_bonus += 0.15 * url_overlap
-            direct_match_bonus += _field_phrase_bonus(direct_query_terms or list(scoring_query_tokens), f"{title_text} {url_text}")
+            direct_match_bonus += _field_phrase_bonus(
+                direct_query_terms or list(scoring_query_tokens),
+                f"{title_text} {heading_text} {url_text}",
+            )
             if title_url_overlap >= 0.75:
                 direct_match_bonus += 0.20
             if len(scoring_query_tokens) <= 3 and title_url_overlap >= 0.60:
@@ -592,7 +793,10 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         if candidate.get("distance") is not None:
             dense_bonus = max(0.0, (DISTANCE_THRESHOLD - candidate["distance"]) / DISTANCE_THRESHOLD)
         sparse_bonus = min(1.0, candidate.get("bm25_score", 0.0) / 10.0)
-        lexical_prepass_bonus = min(1.0, candidate.get("lexical_prepass_score", 0.0) / 2.0)
+        # Score lexical exactness for every fused candidate. The prepass pool
+        # size varies with k, so its cached score must not change rerank features.
+        lexical_exactness_score = _lexical_prepass_score(query, metadata, 0.0)
+        lexical_prepass_bonus = min(1.0, lexical_exactness_score / 2.0)
         if candidate.get("pinned_lexical"):
             lexical_prepass_bonus += 1 / (RRF_K + candidate.get("lexical_prepass_rank", RRF_K))
         doc_type_bonus = 0.0
@@ -639,6 +843,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
                 "lexical_prepass": 0.25 * lexical_prepass_bonus,
                 "direct_match": direct_match_bonus,
                 "support_evidence": support_evidence_bonus,
+                "context_alignment": context_alignment_bonus,
                 "provider_documentation": provider_doc_bonus,
                 "dashboard_package_match": dashboard_package_bonus,
                 "parent_learning_path": parent_learning_path_bonus,
@@ -651,7 +856,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
             full_query_title_overlap = len(query_tokens & title_tokens) / len(query_tokens)
             full_query_heading_overlap = len(query_tokens & heading_tokens) / len(query_tokens)
             exact_entity_bonus = 0.0
-            if salient_query_tokens and (salient_query_tokens & title_url_tokens):
+            if entity_query_tokens and (entity_query_tokens & title_url_tokens):
                 exact_entity_bonus = 0.18
             contributions = {
                 "reciprocal_rank_fusion": candidate.get("rrf_score", 0.0),
@@ -663,6 +868,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
                 "bm25": 0.15 * sparse_bonus,
                 "lexical_prepass": 0.35 * lexical_prepass_bonus,
                 "support_evidence": support_evidence_bonus,
+                "context_alignment": context_alignment_bonus,
                 "provider_documentation": provider_doc_bonus,
                 "dashboard_package_match": dashboard_package_bonus,
                 "exact_entity": exact_entity_bonus,
@@ -784,9 +990,24 @@ def hybrid_search(
     return combined[:k]
 
 
-def deduplicate_urls(results: List[Dict[str, Any]], max_chunks_per_url: int = 1) -> List[Dict[str, Any]]:
-    """Keep the highest-ranked chunk for each canonical page by default."""
+def _learning_path_family_key(url: str) -> Optional[str]:
+    parsed = urlparse(url or "")
+    if parsed.netloc.lower() != "learn.arm.com":
+        return None
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) < 3 or path_parts[0] != "learning-paths":
+        return None
+    return "/".join(path_parts[:3]).lower()
+
+
+def deduplicate_urls(
+    results: List[Dict[str, Any]],
+    max_chunks_per_url: int = 1,
+    max_results_per_learning_path: int = MAX_RESULTS_PER_LEARNING_PATH,
+) -> List[Dict[str, Any]]:
+    """Keep unique pages while limiting one learning path from saturating results."""
     seen_counts: Dict[str, int] = {}
+    family_counts: Dict[str, int] = {}
     deduplicated_results = []
     for item in results:
         metadata = item["metadata"]
@@ -808,6 +1029,12 @@ def deduplicate_urls(results: List[Dict[str, Any]], max_chunks_per_url: int = 1)
             fragment=semantic_fragment,
         ))
         seen_counts[page_key] = seen_counts.get(page_key, 0) + 1
-        if seen_counts[page_key] <= max_chunks_per_url:
-            deduplicated_results.append(item)
+        if seen_counts[page_key] > max_chunks_per_url:
+            continue
+        family_key = _learning_path_family_key(url)
+        if family_key:
+            family_counts[family_key] = family_counts.get(family_key, 0) + 1
+            if family_counts[family_key] > max_results_per_learning_path:
+                continue
+        deduplicated_results.append(item)
     return deduplicated_results

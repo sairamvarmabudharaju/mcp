@@ -27,9 +27,11 @@ from .search import (
     ParentAwareBM25,
     build_bm25_index,
     build_parent_index,
+    build_query_aliases,
     deduplicate_urls,
     deduplication_candidate_count,
     hybrid_search,
+    normalize_query_for_search,
 )
 
 
@@ -43,6 +45,11 @@ class SearchResources:
     include_disclaimers: bool = True
     utm_source: str | None = None
     parent_index: dict[str, dict[str, Any]] | None = None
+    query_aliases: dict[str, tuple[str, ...]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.query_aliases is None:
+            self.query_aliases = build_query_aliases(self.metadata)
 
 
 def sentence_transformer_cache_folder() -> str | None:
@@ -125,11 +132,12 @@ def search(
 ) -> list[dict[str, Any]]:
     """Return the top ``k`` pages for ``query``; ``include_debug`` attaches the score breakdown."""
     resolved_k = k or resources.default_k
+    normalized_query = normalize_query_for_search(query, resources.query_aliases or {})
     candidate_depth = max(resolved_k * 20, 100)
 
     def ranked_candidates(pool_size: int) -> list[dict[str, Any]]:
         return hybrid_search(
-            query,
+            normalized_query,
             resources.usearch_index,
             resources.metadata,
             resources.embedding_model,
@@ -162,6 +170,10 @@ def search(
         if include_debug:
             result["debug"] = {
                 **item.get("score_debug", {}),
+                "query_normalization": {
+                    "original": query,
+                    "normalized": normalized_query,
+                },
                 "result_rank": rank,
                 "returned_results": len(deduped),
                 "requested_results": resolved_k,

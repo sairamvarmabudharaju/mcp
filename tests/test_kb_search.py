@@ -89,6 +89,116 @@ def test_url_content_tokenization_excludes_hostname_boilerplate():
     assert "awscli" in tokens
 
 
+def test_query_normalization_splits_camel_case_identifiers():
+    normalized = search_module.normalize_query_for_search(
+        "GoogleChrome installation guide", {}
+    )
+
+    assert normalized == "googlechrome google chrome installation guide"
+
+
+def test_query_aliases_are_derived_from_corpus_metadata():
+    metadata = [
+        {
+            "title": "AWS CLI",
+            "keywords": "Amazon Web Services; command line interface",
+            "url": "https://example.com/install-guides/aws-cli/",
+        }
+    ]
+
+    aliases = search_module.build_query_aliases(metadata)
+
+    assert aliases["awscli"] == ("aws", "cli")
+    assert search_module.normalize_query_for_search(
+        "AWSCLI ARM64 setup", aliases
+    ) == "awscli aws cli arm64 setup"
+
+
+def test_query_normalization_preserves_compact_technical_identifiers():
+    aliases = {
+        "tensorflow": ("tensor", "flow"),
+        "int8x16t": ("int8x16", "t"),
+    }
+
+    normalized = search_module.normalize_query_for_search(
+        "TensorFlow int8x16_t", aliases
+    )
+
+    assert normalized == "tensorflow tensor flow int8x16_t int8x16 t"
+
+
+
+def test_query_normalization_canonicalizes_general_setup_phrase():
+    normalized = search_module.normalize_query_for_search(
+        "Set up Docker on an Arm-based instance", {}
+    )
+
+    assert normalized == "setup docker on an arm based instance"
+
+
+def test_ambiguous_compact_aliases_are_not_expanded():
+    aliases = search_module.build_query_aliases(
+        [{"title": "AB CDE"}, {"title": "ABC DE"}]
+    )
+
+    assert "abcde" not in aliases
+    assert search_module.normalize_query_for_search(
+        "ABCDE setup", aliases
+    ) == "abcde setup"
+
+
+def test_google_provider_detection_requires_a_provider_phrase():
+    assert not search_module._is_google_provider_query({"google", "chrome"})
+    assert not search_module._is_google_provider_query({"docker", "engine"})
+    assert search_module._is_google_provider_query({"google", "cloud"})
+    assert search_module._is_google_provider_query({"compute", "engine"})
+    assert search_module._is_google_provider_query({"gke"})
+
+
+
+def test_long_query_exact_bonus_requires_a_non_generic_entity():
+    generic = {
+        **_metadata(),
+        "title": "Run a web app on an instance",
+        "url": "https://example.com/web-app/",
+        "doc_type": "learning path",
+    }
+
+    result = search_module.rerank_candidates(
+        "run my web app on an instance", [_candidate(generic)]
+    )[0]
+
+    assert result["score_debug"]["query_analysis"]["entity_tokens"] == []
+    assert result["score_debug"]["contributions"].get("exact_entity", 0.0) == 0.0
+
+
+def test_direct_phrase_scoring_prefers_a_matching_heading_anchor():
+    base = {
+        **_metadata(),
+        "title": "AWS CLI",
+        "search_text": "AWS command line interface installation guide",
+        "doc_type": "install guide",
+    }
+    overview = {
+        **base,
+        "chunk_uuid": "aws-overview",
+        "url": "https://example.com/install-guides/aws-cli/#about",
+        "heading": "About AWS CLI",
+    }
+    installation = {
+        **base,
+        "chunk_uuid": "aws-installation",
+        "url": "https://example.com/install-guides/aws-cli/#install",
+        "heading": "How do I download and install AWS CLI version 2?",
+    }
+
+    results = search_module.rerank_candidates(
+        "install aws cli", [_candidate(overview), _candidate(installation)]
+    )
+
+    assert results[0]["metadata"]["chunk_uuid"] == "aws-installation"
+
+
 # --- fusion and parent resolution ------------------------------------------
 
 
@@ -130,6 +240,28 @@ def test_hybrid_search_records_retrieval_ranks_and_score_contributions(monkeypat
         "fused_candidates": 1,
     }
     assert debug["final_score"] == pytest.approx(sum(debug["contributions"].values()))
+
+
+def test_rerank_lexical_exactness_ignores_cached_prepass_score():
+    metadata = {
+        **_metadata(),
+        "chunk_uuid": "docker-guide",
+        "url": "https://learn.arm.com/install-guides/docker/",
+        "title": "Docker",
+        "search_text": "Install Docker Engine on Arm Linux",
+    }
+    unpinned = search_module.rerank_candidates(
+        "setup docker on arm", [_candidate(metadata)]
+    )[0]
+    cached_candidate = _candidate(metadata)
+    cached_candidate["lexical_prepass_score"] = 99.0
+    cached = search_module.rerank_candidates(
+        "setup docker on arm", [cached_candidate]
+    )[0]
+
+    unpinned_bonus = unpinned["score_debug"]["contributions"]["lexical_prepass"]
+    cached_bonus = cached["score_debug"]["contributions"]["lexical_prepass"]
+    assert cached_bonus == pytest.approx(unpinned_bonus)
 
 
 def test_hybrid_search_fuses_windows_from_the_same_parent(monkeypatch):
@@ -204,6 +336,17 @@ def test_bm25_index_has_one_document_per_parent():
     assert index is not None
     assert index.metadata_indices.tolist() == [0, 2]
     assert search_module.bm25_search("sibling-only-noise", metadata, index, k=5) == []
+
+
+def test_bm25_index_uses_first_window_when_metadata_is_reordered():
+    window_one, window_two = _windows()
+
+    index = search_module.build_bm25_index([window_two, window_one])
+
+    assert index is not None
+    assert index.metadata_indices.tolist() == [1]
+    assert "full" in index.index.doc_freqs[0]
+    assert "continuation" not in index.index.doc_freqs[0]
 
 
 def test_parent_aware_bm25_scatters_scores_to_metadata_positions():
@@ -323,6 +466,40 @@ def test_public_search_only_returns_debug_details_when_requested(monkeypatch):
     assert debug_result[0]["debug"]["final_score"] == debug_result[0]["score"]
 
 
+def test_public_search_uses_corpus_derived_query_normalization(monkeypatch):
+    metadata = {
+        **_metadata(),
+        "chunk_uuid": "aws-cli",
+        "url": "https://example.com/install-guides/aws-cli/",
+        "title": "AWS CLI",
+        "keywords": "AWS CLI; install",
+    }
+    candidate = {
+        "metadata": metadata,
+        "distance": 0.25,
+        "rerank_score": 0.75,
+        "score_debug": {},
+    }
+    observed_queries = []
+
+    def fake_hybrid_search(query, *args, **kwargs):
+        observed_queries.append(query)
+        return [candidate]
+
+    monkeypatch.setattr(resources_module, "hybrid_search", fake_hybrid_search)
+    resources = _resources([metadata])
+
+    result = resources_module.search(
+        "AWSCLI ARM64 setup", resources, include_debug=True
+    )[0]
+
+    assert observed_queries == ["awscli aws cli arm64 setup"]
+    assert result["debug"]["query_normalization"] == {
+        "original": "AWSCLI ARM64 setup",
+        "normalized": "awscli aws cli arm64 setup",
+    }
+
+
 def test_public_search_returns_the_full_parent_text_for_a_window_hit(monkeypatch):
     window_one, window_two = _windows()
     _patch_retrievers(monkeypatch, dense=[{"metadata": window_two, "rank": 1, "distance": 0.2}])
@@ -395,6 +572,40 @@ def test_deduplicate_urls_groups_by_resolved_url():
     assert len(search_module.deduplicate_urls(results)) == 1
 
 
+def test_deduplicate_urls_limits_learning_path_family_saturation():
+    results = [
+        {"metadata": {"url": f"https://learn.arm.com/learning-paths/mobile/audio/{step}/"}}
+        for step in ("1-intro", "2-build", "3-run")
+    ] + [
+        {"metadata": {"url": "https://learn.arm.com/learning-paths/servers/whisper/1-run/"}}
+    ]
+
+    assert search_module.deduplicate_urls(results) == [results[0], results[1], results[3]]
+
+
+def test_context_alignment_prefers_server_content_over_mobile_content():
+    server = _candidate({
+        **_metadata(),
+        "chunk_uuid": "server-whisper",
+        "url": "https://learn.arm.com/learning-paths/servers-and-cloud-computing/whisper/",
+        "title": "Run Whisper speech recognition",
+    })
+    mobile = _candidate({
+        **_metadata(),
+        "chunk_uuid": "mobile-whisper",
+        "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/whisper/",
+        "title": "Run Whisper speech recognition",
+    })
+
+    ranked = search_module.rerank_candidates(
+        "run whisper speech to text on an arm server", [mobile, server]
+    )
+
+    assert ranked[0]["metadata"]["chunk_uuid"] == "server-whisper"
+    assert ranked[0]["score_debug"]["contributions"]["context_alignment"] > 0
+    assert ranked[1]["score_debug"]["contributions"]["context_alignment"] < 0
+
+
 # --- reranking bonuses -------------------------------------------------------
 
 
@@ -422,6 +633,17 @@ def test_install_guides_receive_install_intent_bonus():
 def test_install_bonus_requires_the_named_product():
     ranked = search_module.rerank_candidates(
         "How do I install Docker on Ubuntu?",
+        [_install_guide("gfortran", "GFortran"), _install_guide("docker", "Docker")],
+    )
+    by_uuid = {item["metadata"]["chunk_uuid"]: item for item in ranked}
+
+    assert by_uuid["docker-guide"]["score_debug"]["contributions"]["document_type"] == pytest.approx(0.35)
+    assert by_uuid["gfortran-guide"]["score_debug"]["contributions"]["document_type"] == pytest.approx(0.10)
+
+
+def test_setup_intent_receives_the_same_product_gated_install_bonus():
+    ranked = search_module.rerank_candidates(
+        "setup docker on an arm instance",
         [_install_guide("gfortran", "GFortran"), _install_guide("docker", "Docker")],
     )
     by_uuid = {item["metadata"]["chunk_uuid"]: item for item in ranked}
