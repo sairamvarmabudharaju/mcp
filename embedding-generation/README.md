@@ -142,3 +142,7 @@ uv run --locked pytest
 ```
 
 To check a new document, add or update a question in `eval_questions.json` with the document URL in `expected_urls`, then run the wrapper. Review `Hit@1`, `Hit@3`, `Hit@5`, `MRR`, and any printed misses before committing the CSV change.
+
+For capability measurement, graded URL matching, holdout reporting, targeted
+hive-mind acceptance queries, and comparisons over the real MCP stdio transport,
+see [evals/README.md](evals/README.md).
