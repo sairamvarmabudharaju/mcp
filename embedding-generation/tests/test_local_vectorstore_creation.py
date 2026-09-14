@@ -140,6 +140,22 @@ def test_prepare_embedding_records_keeps_short_source_as_one_record():
     assert metadata[0]["chunk_count"] == 1
 
 
+def test_intrinsic_uses_one_context_window_and_keeps_full_lexical_text():
+    body = " ".join(f"word{index}" for index in range(20))
+    source = _source(body, chunk_uuid="intrinsic_vaddq_s32")
+
+    contents, metadata = prepare_embedding_records(
+        [source], WhitespaceTokenizer(), max_seq_length=10, overlap_tokens=2
+    )
+
+    assert len(contents) == 1
+    assert metadata[0]["chunk_count"] == 1
+    assert metadata[0]["embedding_window_policy"] == "single_context_window"
+    assert metadata[0]["content_end_char"] < len(body)
+    assert metadata[0]["original_text"] == source["content"]
+    assert body in metadata[0]["search_text"]
+
+
 def test_windows_start_and_end_on_word_boundaries():
     text = " ".join("abcdefgh" for _ in range(12))  # every word is three pieces
 

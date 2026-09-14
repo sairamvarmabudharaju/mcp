@@ -7,11 +7,12 @@ hive-mind area. A follow-up ranking fix preserves the 100% targeted hit@5 while
 raising broad draft-golden hit@5 to 89.6%, above both the initial candidate
 (81.4%) and the published baseline (86.3%).
 
-The expanded-corpus, old-vectorization isolation ties the initial windowed
-candidate on both hit@5 headlines. The lossless overlapping windows therefore
-provide no measurable benefit on these 213 queries. Expanded source coverage
-plus current ranking is sufficient for all 30 targeted queries. Lossless
-identifier handling and result diversity recover the broad ranking regression.
+An adaptive embedding policy reduces the final index from 60,052 to 48,092
+vectors by keeping one dense vector per intrinsic while preserving lossless
+windows for documentation. All 213 query ranks are identical to the fully
+windowed ranking-fix candidate. Expanded source coverage, lossless identifier
+handling, and result diversity therefore improve retrieval without requiring
+repetitive intrinsic child windows.
 
 ## Method
 
@@ -34,6 +35,7 @@ identifier handling and result diversity recover the broad ranking regression.
 | Current ranking + expanded corpus + old vectorization | 66.7% | 76.5% | 81.4% | 76.5% | 93.3% | 100% |
 | Current ranking + expanded corpus + overlapping windows | 67.2% | 77.6% | 81.4% | 76.0% | 93.3% | 100% |
 | Ranking fix + expanded corpus + overlapping windows | 75.4% | 85.8% | 89.6% | 83.6% | 93.3% | 100% |
+| Ranking fix + adaptive intrinsic windows | 75.4% | 85.8% | 89.6% | 83.6% | 93.3% | 100% |
 
 The ranking fix's bootstrap 95% interval for broad H@5 is 85.2–94.0%. Against
 the initial candidate it gains 16 and loses one golden hit@5 case, with 25 rank
@@ -62,6 +64,27 @@ top three.
 An ablation that kept the original user string exclusively for dense retrieval
 scored 89.1% broad hit@5 and lost the SVE runtime-detection hit at rank five. It
 provided no targeted benefit and was not retained.
+
+## Embedding-count optimization
+
+| Index | Parent chunks | Vectors | Data payload | Golden H@5 | Targeted H@5 |
+|---|---:|---:|---:|---:|---:|
+| Published baseline | 35,018 | 35,018 | — | 86.3% | 13.3% |
+| Fully windowed ranking fix | 35,259 | 60,052 | 205 MB | 89.6% | 100% |
+| Adaptive intrinsic windows | 35,259 | 48,092 | 177 MB | 89.6% | 100% |
+| One vector for every parent | 35,259 | 35,259 | 148 MB | 89.1% | 100% |
+
+Only 241 parent chunks come from corpus expansion. The original vector-count
+increase came from long-document windowing, not a large increase in source
+chunks. Intrinsics accounted for 11,960 extra child windows: 10,384 intrinsic
+parents expanded to 22,344 vectors.
+
+Removing only those intrinsic child windows reduces vector count by 19.9% and
+the data payload by 13.7%. The paired comparison against the fully windowed
+candidate has zero rank improvements and zero regressions across all 183 golden
+and 30 hive-mind queries. In contrast, using one vector for every parent gains
+one golden hit@5 case but loses two, including SVE runtime detection and the
+illegal-instruction troubleshooting query.
 
 ## What the isolation says
 
@@ -107,11 +130,13 @@ intrinsic query, and the Zephyr Cortex-M55/Ethos-U55 query.
 | Expanded old-vector isolation | `sha256:16a36b6415eefbb7520e1524e26420621f13c560750aa0e67c6fcd3af830308d` |
 | Windowed candidate | `sha256:83ebc56b87e48882febc847b839e5ca2899996a1af158f5e2bb4c3188b8b7e32` |
 | Ranking-fix candidate | `sha256:c282d7292065bee48bf6f91133633078d056188c15baec44823fd76749af14fb` |
+| Adaptive intrinsic-window candidate | `sha256:95b9fcd6eff2202c9b2537087f06a6957fef72935cc64bc5a029eb1f5b92c88b` |
 
 The isolation and initial candidate have identical `search.py`, `resources.py`,
 and `server.py` hashes. Their raw scored rows, responses, and server logs are in
 `/private/tmp/hivemind-unified-real-mcp-20260914`. Ranking-fix artifacts are in
-`/private/tmp/hivemind-ranking-fix-real-mcp-20260914`.
+`/private/tmp/hivemind-ranking-fix-real-mcp-20260914`; adaptive-policy artifacts
+are in `/private/tmp/hivemind-selective-intrinsic-real-mcp-20260914`.
 
 ## Caveats
 
@@ -120,6 +145,6 @@ and `server.py` hashes. Their raw scored rows, responses, and server logs are in
   expanded candidate contains newer pages.
 - The expanded source data came from the retained synchronized corpus. A fresh
   internet acquisition did not complete and is not claimed here.
-- This result shows that overlapping windows are unnecessary for the measured
-  suites; it does not prove they cannot help long documents or unrepresented
-  queries.
+- This result shows that intrinsic child windows are unnecessary for the
+  measured suites; it does not prove they cannot help unrepresented intrinsic
+  queries. Documentation keeps lossless overlapping windows.

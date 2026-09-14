@@ -104,6 +104,19 @@ Educational Course,All rights reserved,Example Video,https://courses.edx.org/vid
 
 Leave the column empty for sources that are chunked from their primary `URL`.
 
+### Embedding window policy
+
+The vector-store builder uses lossless, tokenizer-aligned overlapping windows
+for documentation chunks that exceed the embedding model's input limit.
+Intrinsic records use one context-rich dense vector instead: the intrinsic name
+and signature are at the beginning of the record, while the representative
+metadata row retains the complete text for lexical search and display. This
+avoids embedding repetitive usage guidance for every intrinsic without
+truncating user-visible or lexical content.
+
+Each metadata row records `embedding_window_policy` as either
+`lossless_overlap` or `single_context_window` for auditing.
+
 
 ## Test Locally
 

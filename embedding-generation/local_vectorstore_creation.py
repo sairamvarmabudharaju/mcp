@@ -28,6 +28,7 @@ from usearch.index import Index
 EMBEDDING_WINDOW_OVERLAP_TOKENS = 32
 MAX_EMBEDDING_CONTEXT_TOKENS = 64
 EMBEDDING_TOKEN_SAFETY_MARGIN = 2
+SINGLE_WINDOW_CHUNK_PREFIXES = ("intrinsic_",)
 CONTENT_PREFIX_PATTERN = re.compile(
     r"^Document Title:\s*(.*?)\nHeading Path:\s*(.*?)\n\n",
     re.DOTALL,
@@ -199,6 +200,14 @@ def _content_body(content: str) -> str:
     return content[match.end():] if match else content
 
 
+def _embedding_window_policy(yaml_content: dict) -> str:
+    """Use one dense vector for self-identifying records such as intrinsics."""
+    chunk_uuid = str(yaml_content.get("chunk_uuid", ""))
+    if chunk_uuid.startswith(SINGLE_WINDOW_CHUNK_PREFIXES):
+        return "single_context_window"
+    return "lossless_overlap"
+
+
 def _metadata_for_window(
     yaml_content: dict,
     original_text: str,
@@ -211,6 +220,7 @@ def _metadata_for_window(
     content_end_char: int,
     parent_content_length: int,
     embedding_token_count: int,
+    embedding_window_policy: str,
 ) -> dict:
     window_reference = {
         "chunk_uuid": chunk_uuid,
@@ -221,6 +231,7 @@ def _metadata_for_window(
         "content_end_char": content_end_char,
         "parent_content_length": parent_content_length,
         "embedding_token_count": embedding_token_count,
+        "embedding_window_policy": embedding_window_policy,
     }
     if chunk_index != 1:
         # Dense retrieval only needs enough information to resolve this vector
@@ -310,13 +321,14 @@ def prepare_embedding_records(
     max_seq_length: int,
     overlap_tokens: int = EMBEDDING_WINDOW_OVERLAP_TOKENS,
 ) -> tuple[list[str], list[dict]]:
-    """Create lossless overlapping windows that fit the embedding model.
+    """Create adaptive embedding records that fit the embedding model.
 
-    Every window becomes one vector. The first window of a chunk carries the
-    chunk's full display text and lexical search text. Later windows carry only
-    a compact reference to that representative row. The server groups windows
-    by ``parent_chunk_uuid`` and scores and displays each parent through its
-    first window, so search results still return the whole chunk.
+    Documentation uses lossless overlapping windows. Self-identifying records
+    such as intrinsics use one context-rich vector because their title and
+    signature carry the dense-search identity; their complete text remains in
+    the representative row for lexical search and display. The server groups
+    windows by ``parent_chunk_uuid`` and scores and displays each parent through
+    its first window.
     """
     special_tokens = tokenizer.num_special_tokens_to_add(pair=False)
     contents = []
@@ -342,8 +354,11 @@ def prepare_embedding_records(
             - EMBEDDING_TOKEN_SAFETY_MARGIN
         )
         parent_chunk_uuid = yaml_content["chunk_uuid"]
+        embedding_window_policy = _embedding_window_policy(yaml_content)
         while True:
             spans = _window_spans(tokenizer, body, body_budget, overlap_tokens)
+            if embedding_window_policy == "single_context_window":
+                spans = spans[:1]
             fitted_windows = []
             covered_end_char = 0
             budget_reduction = 0
@@ -377,6 +392,8 @@ def prepare_embedding_records(
                         trimmed,
                     )
                 )
+            if embedding_window_policy == "single_context_window" and fitted_windows:
+                break
             if coverage_is_lossless and covered_end_char == len(body):
                 break
             body_budget -= max(1, budget_reduction)
@@ -418,6 +435,7 @@ def prepare_embedding_records(
                     fitted_end_char,
                     len(body),
                     embedding_token_count,
+                    embedding_window_policy,
                 )
             )
     if trimmed_windows:
@@ -498,9 +516,15 @@ def main():
         model.max_seq_length,
     )
     split_parents = len({item["parent_chunk_uuid"] for item in metadata if item["chunk_count"] > 1})
+    single_window_parents = len({
+        item["parent_chunk_uuid"]
+        for item in metadata
+        if item["embedding_window_policy"] == "single_context_window"
+    })
     print(
         f"Prepared {len(contents)} embedding windows from {len(yaml_contents)} source chunks; "
-        f"split {split_parents} oversized chunks"
+        f"split {split_parents} oversized chunks and used one context window for "
+        f"{single_window_parents} self-identifying chunks"
     )
 
     # Create embeddings
