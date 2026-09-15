@@ -62,7 +62,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          uv run --directory mcp-local --locked --only-group test \
+          uv run --directory mcp-local --locked --group test \
             pytest -q \
             tests/test_build_inputs.py \
             tests/test_invocation_logger.py \

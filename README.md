@@ -174,7 +174,6 @@ The debug payload includes:
 - the weighted contribution from every reranking signal
 - query tokens and the selected short- or long-query scoring profile
 - the window that matched when a long chunk was split into several embedding windows
-- for intrinsic lookups, the detected symbol, types and category phrases and each intrinsic's structured fit
 - candidate counts before fusion and URL deduplication
 
 ## Logging

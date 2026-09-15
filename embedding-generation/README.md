@@ -112,19 +112,15 @@ text is silently truncated. Only the first window of a chunk carries the full
 text and lexical fields; later windows hold a compact reference to it, and the
 server resolves every hit back to that first window.
 
-Intrinsic records (developer.arm.com `#q=` pages) get one dense vector instead.
-Their identity is structured, so `intrinsic_taxonomy.py` derives it from Arm's
-own metadata: the intrinsic name, the category phrases Arm ships in the record
-keywords ("maximum across vector", "table lookup", "gather"), a short synonym
-table for common phrasings ("horizontal max", "shuffle", "popcount"), and the
-C signature (argument and return types, element size, signedness, lane count).
-The same terms are prepended to the lexical `search_text`, and the server reads
-its intrinsic vocabulary from these rows, so a rebuilt index brings new
-categories with it without a server change. `intrinsic_taxonomy_version` is
-stamped on every intrinsic row.
+Intrinsic records (developer.arm.com `#q=` pages) retain the existing raw
+embedding input and one vector per record, including the embedding model's
+existing truncation behavior. Their full descriptions remain available for
+lexical search and display. Intrinsic taxonomy enrichment and dedicated
+intrinsic ranking are deferred to a separate change.
 
 Each metadata row records `embedding_window_policy` as either
-`lossless_overlap` or `single_context_window` for auditing.
+`lossless_overlap` (documentation) or `legacy_single_vector` (intrinsics)
+for auditing. The lossless coverage guarantee applies to documentation.
 
 
 ## Test Locally

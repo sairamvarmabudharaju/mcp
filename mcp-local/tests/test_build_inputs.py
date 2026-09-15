@@ -704,7 +704,6 @@ def test_toolchain_input_changes_rebuild_and_propose_pin() -> None:
         "document_chunking.py",
         "embedding-model.lock.json",
         "generate-chunks.py",
-        "intrinsic_taxonomy.py",
         "local_vectorstore_creation.py",
         "pyproject.toml",
         "uv.lock",

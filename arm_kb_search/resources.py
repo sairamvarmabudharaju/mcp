@@ -22,7 +22,6 @@ from usearch.index import Index
 from .config import K_RESULTS
 from .loaders import load_metadata, load_usearch_index
 from .response import add_disclaimer_to_arm_results, add_utm_source_to_results
-from .intrinsic_search import IntrinsicIndex, build_intrinsic_index
 from .search import (
     LEXICAL_PREPASS_DEPTH,
     ParentAwareBM25,
@@ -45,7 +44,10 @@ class SearchResources:
     include_disclaimers: bool = True
     utm_source: str | None = None
     parent_index: dict[str, dict[str, Any]] | None = None
-    intrinsic_index: IntrinsicIndex | None = None
+
+    def __post_init__(self) -> None:
+        if self.parent_index is None:
+            self.parent_index = build_parent_index(self.metadata)
 
 
 def sentence_transformer_cache_folder() -> str | None:
@@ -117,7 +119,6 @@ def load_search_resources(
         include_disclaimers=include_disclaimers,
         utm_source=utm_source,
         parent_index=build_parent_index(metadata),
-        intrinsic_index=build_intrinsic_index(metadata),
     )
 
 
@@ -130,6 +131,8 @@ def search(
     """Return the top ``k`` pages for ``query``; ``include_debug`` attaches the score breakdown."""
     resolved_k = k or resources.default_k
     normalized_query = normalize_query_for_search(query)
+    if not normalized_query:
+        return []
     candidate_depth = max(resolved_k * 20, 100)
 
     def ranked_candidates(pool_size: int) -> list[dict[str, Any]]:
@@ -142,7 +145,6 @@ def search(
             k=pool_size,
             candidate_depth=candidate_depth,
             parent_index=resources.parent_index,
-            intrinsic_index=resources.intrinsic_index,
         )
 
     pool_size = deduplication_candidate_count(resolved_k)

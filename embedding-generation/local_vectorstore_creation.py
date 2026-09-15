@@ -25,12 +25,9 @@ import yaml
 from sentence_transformers import SentenceTransformer
 from usearch.index import Index
 
-from intrinsic_taxonomy import enrich_intrinsic_record, is_intrinsic_record
-
 EMBEDDING_WINDOW_OVERLAP_TOKENS = 32
 MAX_EMBEDDING_CONTEXT_TOKENS = 64
 EMBEDDING_TOKEN_SAFETY_MARGIN = 2
-SINGLE_WINDOW_CHUNK_PREFIXES = ("intrinsic_",)
 CONTENT_PREFIX_PATTERN = re.compile(
     r"^Document Title:\s*(.*?)\nHeading Path:\s*(.*?)\n\n",
     re.DOTALL,
@@ -202,12 +199,11 @@ def _content_body(content: str) -> str:
     return content[match.end():] if match else content
 
 
-def _embedding_window_policy(yaml_content: dict) -> str:
-    """Use one dense vector for self-identifying records such as intrinsics."""
-    chunk_uuid = str(yaml_content.get("chunk_uuid", ""))
-    if chunk_uuid.startswith(SINGLE_WINDOW_CHUNK_PREFIXES) or is_intrinsic_record(yaml_content):
-        return "single_context_window"
-    return "lossless_overlap"
+def _is_legacy_intrinsic(record: dict) -> bool:
+    """Keep intrinsic embedding inputs unchanged while document windowing evolves."""
+    return str(record.get("chunk_uuid", "")).startswith("intrinsic_") or (
+        "/instruction-sets/intrinsics/" in str(record.get("url", ""))
+    )
 
 
 def _metadata_for_window(
@@ -272,11 +268,6 @@ def _metadata_for_window(
         "version": yaml_content.get("version", ""),
         "content_type": yaml_content.get("content_type", ""),
         "search_text": search_text,
-        **{
-            key: value
-            for key, value in yaml_content.items()
-            if key.startswith("intrinsic_") and key not in ("intrinsic_embedding_text", "intrinsic_search_text_prefix")
-        },
     }
 
 
@@ -330,27 +321,34 @@ def prepare_embedding_records(
 ) -> tuple[list[str], list[dict]]:
     """Create adaptive embedding records that fit the embedding model.
 
-    Documentation uses lossless overlapping windows. Self-identifying records
-    such as intrinsics use one context-rich vector because their title and
-    signature carry the dense-search identity; their complete text remains in
-    the representative row for lexical search and display. The server groups
-    windows by ``parent_chunk_uuid`` and scores and displays each parent through
-    its first window.
+    Documentation uses lossless overlapping windows. Intrinsics keep main's
+    original input text and one-vector encoding, including the model's existing
+    truncation behavior. Their complete text remains available for lexical search
+    and display. The server groups document windows by ``parent_chunk_uuid`` and
+    scores and displays each parent through its first window.
     """
     special_tokens = tokenizer.num_special_tokens_to_add(pair=False)
     contents = []
     metadata = []
     trimmed_windows = 0
-    for source_yaml_content in yaml_contents:
-        yaml_content = source_yaml_content
-        intrinsic_embedding_text = ""
-        if is_intrinsic_record(source_yaml_content):
-            enrichment = enrich_intrinsic_record(source_yaml_content)
-            yaml_content = {**source_yaml_content, **enrichment}
-            intrinsic_embedding_text = enrichment["intrinsic_embedding_text"]
+    for yaml_content in yaml_contents:
         source_content = yaml_content["content"]
-        body = intrinsic_embedding_text or _content_body(source_content)
-        context = "" if intrinsic_embedding_text else _embedding_context(yaml_content, tokenizer)
+        if _is_legacy_intrinsic(yaml_content):
+            # Do not rewrite intrinsic descriptions or lexical metadata in the
+            # document-windowing change. The encoder retains its legacy limit.
+            contents.append(source_content)
+            token_count = len(tokenizer(
+                source_content, add_special_tokens=True, truncation=False, padding=False
+            )["input_ids"])
+            metadata.append(_metadata_for_window(
+                yaml_content, source_content, source_content,
+                yaml_content["chunk_uuid"], yaml_content["chunk_uuid"], 1, 1,
+                0, len(source_content), len(source_content),
+                min(token_count, max_seq_length), "legacy_single_vector",
+            ))
+            continue
+        body = _content_body(source_content)
+        context = _embedding_context(yaml_content, tokenizer)
         separator = "\n\n" if context and body else ""
         context_token_count = len(
             tokenizer(
@@ -367,25 +365,9 @@ def prepare_embedding_records(
             - EMBEDDING_TOKEN_SAFETY_MARGIN
         )
         parent_chunk_uuid = yaml_content["chunk_uuid"]
-        embedding_window_policy = _embedding_window_policy(yaml_content)
-        if intrinsic_embedding_text:
-            critical_token_count = len(
-                tokenizer(
-                    intrinsic_embedding_text,
-                    add_special_tokens=True,
-                    truncation=False,
-                    padding=False,
-                )["input_ids"]
-            )
-            if critical_token_count > max_seq_length:
-                print(
-                    f"Warning: intrinsic text for {parent_chunk_uuid} exceeds the model token limit "
-                    f"({critical_token_count} > {max_seq_length}); the end will be trimmed."
-                )
+        embedding_window_policy = "lossless_overlap"
         while True:
             spans = _window_spans(tokenizer, body, body_budget, overlap_tokens)
-            if embedding_window_policy == "single_context_window":
-                spans = spans[:1]
             fitted_windows = []
             covered_end_char = 0
             budget_reduction = 0
@@ -419,8 +401,6 @@ def prepare_embedding_records(
                         trimmed,
                     )
                 )
-            if embedding_window_policy == "single_context_window" and fitted_windows:
-                break
             if coverage_is_lossless and covered_end_char == len(body):
                 break
             body_budget -= max(1, budget_reduction)
@@ -449,10 +429,7 @@ def prepare_embedding_records(
             original_text = source_content if chunk_index == 1 else ""
             search_text_content = ""
             if chunk_index == 1:
-                # Intrinsics: Arm's categories, synonyms and description precede the body
-                # so lexical search matches "population count" or "horizontal add".
-                lexical_prefix = yaml_content.get("intrinsic_search_text_prefix", "")
-                search_text_content = f"{lexical_prefix}\n{source_content}" if lexical_prefix else source_content
+                search_text_content = source_content
             contents.append(embedding_text)
             metadata.append(
                 _metadata_for_window(
@@ -548,15 +525,15 @@ def main():
         model.max_seq_length,
     )
     split_parents = len({item["parent_chunk_uuid"] for item in metadata if item["chunk_count"] > 1})
-    single_window_parents = len({
+    legacy_intrinsic_parents = len({
         item["parent_chunk_uuid"]
         for item in metadata
-        if item["embedding_window_policy"] == "single_context_window"
+        if item["embedding_window_policy"] == "legacy_single_vector"
     })
     print(
         f"Prepared {len(contents)} embedding windows from {len(yaml_contents)} source chunks; "
-        f"split {split_parents} oversized chunks and used one context window for "
-        f"{single_window_parents} self-identifying chunks"
+        f"split {split_parents} oversized document chunks and preserved "
+        f"{legacy_intrinsic_parents} legacy intrinsic vectors"
     )
 
     # Create embeddings

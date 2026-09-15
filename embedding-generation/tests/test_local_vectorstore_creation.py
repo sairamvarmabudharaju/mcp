@@ -140,110 +140,20 @@ def test_prepare_embedding_records_keeps_short_source_as_one_record():
     assert metadata[0]["chunk_count"] == 1
 
 
-def _intrinsic_source(
-    name="vaddvq_u8",
-    description=(
-        "Add across Vector. This instruction adds every vector element in the "
-        "source register together and writes the scalar result."
-    ),
-    signature="uint8_t vaddvq_u8 (uint8x16_t a);",
-    keywords="neon, vector arithmetic, addition across vector, intrinsic",
-    chunk_uuid="intrinsic_vaddvq_u8",
-):
-    content = (
-        f"The `{name}` intrinsic is part of the Neon instruction set architecture. "
-        f"Here is a brief intrinsic description: {description}\n\n"
-        f"The signature for this intrinsic function is as follows:\n`{signature}`\n\n"
-        "To use this Neon intrinsic, add compiler flags and include a header."
-    )
-    return _source(
-        content,
-        chunk_uuid=chunk_uuid,
-        title=f"Arm Intrinsics - {name}",
-        url=f"https://developer.arm.com/architectures/instruction-sets/intrinsics/#q={name}",
-        keywords=keywords,
-        content=content,
-    )
-
-
-def test_intrinsic_uses_compact_embedding_and_keeps_full_lexical_text():
-    source = _intrinsic_source()
+def test_intrinsic_embedding_input_and_lexical_text_keep_legacy_behavior():
+    body = " ".join(f"operation{index}" for index in range(100))
+    source = _source(body, chunk_uuid="intrinsic_example", content=body)
 
     contents, metadata = prepare_embedding_records(
-        [source], WhitespaceTokenizer(), max_seq_length=256, overlap_tokens=2
+        [source], WhitespaceTokenizer(), max_seq_length=10, overlap_tokens=2
     )
 
-    assert len(contents) == 1
+    assert contents == [body]  # The encoder, as on main, applies its own limit.
     assert metadata[0]["chunk_count"] == 1
-    assert metadata[0]["embedding_window_policy"] == "single_context_window"
-    assert contents[0].startswith("vaddvq_u8: Add across Vector.")
-    assert "Neon intrinsic for vector arithmetic; addition across vector" in contents[0]
-    assert "Also called horizontal add" in contents[0]
-    assert "Takes uint8x16_t and returns uint8_t" in contents[0]
-    assert "compiler flags" not in contents[0]
-    assert metadata[0]["doc_type"] == "Intrinsic"
-    assert metadata[0]["intrinsic_categories"] == ["vector arithmetic", "addition across vector"]
-    assert "horizontal add" in metadata[0]["intrinsic_search_terms"]
-    assert metadata[0]["intrinsic_lane_counts"] == [16]
-    assert metadata[0]["intrinsic_element_bits"] == [8]
-    assert metadata[0]["intrinsic_taxonomy_version"] == "2.0.0"
-    assert metadata[0]["original_text"] == source["content"]
-    assert source["content"] in metadata[0]["search_text"]
-    assert "horizontal add" in metadata[0]["search_text"]
-    assert "intrinsic_embedding_text" not in metadata[0]
-    assert "intrinsic_search_text_prefix" not in metadata[0]
-
-
-def test_long_intrinsic_description_is_trimmed_not_fatal():
-    source = _intrinsic_source(description=" ".join(["operation detail"] * 100))
-
-    contents, metadata = prepare_embedding_records(
-        [source], WhitespaceTokenizer(), max_seq_length=64, overlap_tokens=2
-    )
-
-    assert metadata[0]["embedding_token_count"] <= 64
-    assert contents[0].startswith("vaddvq_u8:")
-
-
-def test_new_intrinsic_record_is_enriched_without_uuid_naming_convention():
-    source = _intrinsic_source(chunk_uuid="new-record")
-
-    _, metadata = prepare_embedding_records(
-        [source], WhitespaceTokenizer(), max_seq_length=256, overlap_tokens=2
-    )
-
-    assert metadata[0]["doc_type"] == "Intrinsic"
-    assert metadata[0]["intrinsic_name"] == "vaddvq_u8"
-    assert metadata[0]["embedding_window_policy"] == "single_context_window"
-
-
-def test_sve_signature_types_include_element_size_and_signedness():
-    from intrinsic_taxonomy import signature_types
-
-    details = signature_types("svuint16_t svadd[_u16]_m (svbool_t pg, svuint16_t op1, svuint16_t op2)")
-
-    assert details["intrinsic_output_type"] == "svuint16_t"
-    assert details["intrinsic_input_types"] == ["svbool_t", "svuint16_t", "svuint16_t"]
-    assert details["intrinsic_element_bits"] == [16]
-    assert details["intrinsic_signedness"] == ["unsigned"]
-    assert details["intrinsic_lane_counts"] == []
-
-
-def test_intrinsic_categories_come_from_arm_keywords_with_synonyms():
-    from intrinsic_taxonomy import enrich_intrinsic_record
-
-    fields = enrich_intrinsic_record({
-        "url": "https://developer.arm.com/architectures/instruction-sets/intrinsics/#q=vmaxvq_f32",
-        "title": "Arm Intrinsics - vmaxvq_f32",
-        "keywords": "vmaxvq_f32, neon, vector arithmetic, across vector arithmetic, maximum across vector, intrinsic, sse, avx, streaming simd extension",
-        "content": "The `vmaxvq_f32` intrinsic is part of the Neon instruction set architecture. "
-                   "The signature for this intrinsic function is as follows:\n`float32_t vmaxvq_f32 (float32x4_t a);`",
-    })
-
-    assert fields["intrinsic_isa"] == "Neon"
-    assert fields["intrinsic_categories"] == ["vector arithmetic", "across vector arithmetic", "maximum across vector"]
-    assert {"horizontal max", "largest lane"} <= set(fields["intrinsic_search_terms"])
-    assert fields["intrinsic_lane_counts"] == [4] and fields["intrinsic_element_bits"] == [32]
+    assert metadata[0]["embedding_window_policy"] == "legacy_single_vector"
+    assert metadata[0]["original_text"] == body
+    assert body in metadata[0]["search_text"]
+    assert not any(key.startswith("intrinsic_") for key in metadata[0])
 
 
 def test_windows_start_and_end_on_word_boundaries():

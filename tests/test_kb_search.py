@@ -71,7 +71,6 @@ def _candidate(metadata: dict) -> dict:
 
 def _patch_retrievers(monkeypatch, lexical=(), dense=(), sparse=()):
     monkeypatch.setattr(search_module, "lexical_prepass_search", lambda *a, **k: list(lexical))
-    monkeypatch.setattr(search_module, "intrinsic_candidate_search", lambda *a, **k: [])
     monkeypatch.setattr(search_module, "embedding_search", lambda *a, **k: list(dense))
     monkeypatch.setattr(search_module, "bm25_search", lambda *a, **k: list(sparse))
 
@@ -203,7 +202,6 @@ def test_hybrid_search_records_retrieval_ranks_and_score_contributions(monkeypat
     assert debug["pipeline"] == {
         "candidate_depth": 25,
         "lexical_candidates": 1,
-        "intrinsic_candidates": 0,
         "dense_candidates": 1,
         "bm25_candidates": 1,
         "fused_candidates": 1,
@@ -627,148 +625,6 @@ def test_dashboard_bonus_ignores_generic_query_tokens():
     assert ranked[0]["score_debug"]["contributions"]["dashboard_package_match"] == 0.0
 
 
-# --- intrinsic lookup ----------------------------------------------------------
-
-intrinsic_module = importlib.import_module("arm_kb_search.intrinsic_search")
-
-
-def _intrinsic_row(name, categories, *, isa="Neon", synonyms=(), input_types=(), output_type="", bits=(), signedness=(), lanes=()):
-    return {
-        **_metadata(),
-        "chunk_uuid": f"intrinsic_{name}",
-        "url": f"https://developer.arm.com/architectures/instruction-sets/intrinsics/#q={name}",
-        "title": f"Arm Intrinsics - {name}",
-        "doc_type": "Intrinsic",
-        "intrinsic_taxonomy_version": "2.0.0",
-        "intrinsic_name": name,
-        "intrinsic_isa": isa,
-        "intrinsic_categories": list(categories),
-        "intrinsic_search_terms": [*categories, *synonyms],
-        "intrinsic_input_types": list(input_types),
-        "intrinsic_output_type": output_type,
-        "intrinsic_element_bits": list(bits),
-        "intrinsic_signedness": list(signedness),
-        "intrinsic_lane_counts": list(lanes),
-    }
-
-
-VADDVQ_U8 = _intrinsic_row(
-    "vaddvq_u8", ["vector arithmetic", "addition across vector"], synonyms=["horizontal add"],
-    input_types=["uint8x16_t"], output_type="uint8_t", bits=[8], signedness=["unsigned"], lanes=[16],
-)
-VADDVQ_S8 = _intrinsic_row(
-    "vaddvq_s8", ["vector arithmetic", "addition across vector"], synonyms=["horizontal add"],
-    input_types=["int8x16_t"], output_type="int8_t", bits=[8], signedness=["signed"], lanes=[16],
-)
-VLD1Q_DUP_U8 = _intrinsic_row(
-    "vld1q_dup_u8", ["load", "load and replicate"], synonyms=["broadcast"],
-    input_types=["uint8_t"], output_type="uint8x16_t", bits=[8], signedness=["unsigned"], lanes=[16],
-)
-SVADD_U16 = _intrinsic_row(
-    "svadd[_u16]_m", ["vector arithmetic", "add"], isa="SVE",
-    input_types=["svbool_t", "svuint16_t", "svuint16_t"], output_type="svuint16_t", bits=[16], signedness=["unsigned"],
-)
-INTRINSIC_INDEX = intrinsic_module.build_intrinsic_index([VADDVQ_U8, VADDVQ_S8, VLD1Q_DUP_U8, SVADD_U16])
-
-
-def test_intrinsic_index_learns_its_vocabulary_from_the_metadata():
-    assert INTRINSIC_INDEX is not None
-    assert len(INTRINSIC_INDEX.rows) == 4
-    assert "horizontal add" in INTRINSIC_INDEX.terms and "load and replicate" in INTRINSIC_INDEX.terms
-    assert INTRINSIC_INDEX.terms[0] == max(INTRINSIC_INDEX.terms, key=len)  # longest phrase matched first
-    assert intrinsic_module.build_intrinsic_index([_metadata()]) is None
-
-
-@pytest.mark.parametrize(
-    "query",
-    [
-        "vaddq_f32",
-        "reinterpret int8x16_t as uint8x16_t neon",
-        "horizontal add of all lanes neon intrinsic",
-        "load 4 floats from memory into a neon register",
-        "what does __crc32b do",
-        "what's the arm equivalent of _mm_shuffle_epi8",
-    ],
-)
-def test_intrinsic_intent_needs_a_symbol_a_type_or_a_category_with_intrinsic_or_width(query):
-    assert intrinsic_module.analyze_intrinsic_query(query, INTRINSIC_INDEX)["intent"]
-
-
-@pytest.mark.parametrize(
-    "query",
-    [
-        "difference between neon and sve",
-        "what is the sve vector length on neoverse v1",
-        "SME2 matrix multiply example code",
-        "how do I install docker on arm",
-        "load balancing on arm servers",
-        "How does SME2 multi-vector predication work?",
-    ],
-)
-def test_isa_words_and_generic_vocabulary_are_not_intrinsic_intent(query):
-    analysis = intrinsic_module.analyze_intrinsic_query(query, INTRINSIC_INDEX)
-
-    assert not analysis["intent"]
-    assert intrinsic_module.intrinsic_candidate_search(analysis, INTRINSIC_INDEX, k=5) == []
-
-
-def test_intrinsic_match_prefers_category_and_type_agreement():
-    analysis = intrinsic_module.analyze_intrinsic_query(
-        "how to do a horizontal add of all lanes of a uint8x16_t in neon", INTRINSIC_INDEX
-    )
-
-    assert analysis["terms"] == ["horizontal add"]
-    assert analysis["types"] == ["uint8x16_t"]
-    scores = {
-        row["intrinsic_name"]: intrinsic_module.intrinsic_match_score(analysis, row)
-        for row in INTRINSIC_INDEX.rows
-    }
-    assert scores["vaddvq_u8"] > scores["vaddvq_s8"] > scores["vld1q_dup_u8"]
-    assert scores["vaddvq_u8"] <= 1.0
-    ranked = intrinsic_module.intrinsic_candidate_search(analysis, INTRINSIC_INDEX, k=5)
-    assert ranked[0]["metadata"]["intrinsic_name"] == "vaddvq_u8"
-
-
-def test_sve_types_are_read_and_scored():
-    analysis = intrinsic_module.analyze_intrinsic_query("sve intrinsic to add two uint16 vectors", INTRINSIC_INDEX)
-
-    assert analysis["intent"] and analysis["element_bits"] == [16] and analysis["signedness"] == ["unsigned"]
-    assert intrinsic_module.intrinsic_match_score(analysis, SVADD_U16) > intrinsic_module.intrinsic_match_score(analysis, VADDVQ_U8)
-
-
-def test_isa_agreement_alone_scores_nothing():
-    analysis = {
-        "intent": True, "symbols": [], "x86_symbols": [], "types": [], "element_bits": [],
-        "signedness": [], "lane_counts": [], "isa": ["neon"], "terms": [],
-    }
-
-    assert intrinsic_module.intrinsic_match_score(analysis, VADDVQ_U8) == 0.0
-
-
-def test_exact_symbol_is_a_full_match():
-    analysis = intrinsic_module.analyze_intrinsic_query("vaddvq_u8", INTRINSIC_INDEX)
-
-    assert intrinsic_module.intrinsic_match_score(analysis, VADDVQ_U8) == 1.0
-    assert intrinsic_module.intrinsic_match_score(analysis, VADDVQ_S8) == 0.0
-
-
-def test_hybrid_search_fuses_intrinsic_candidates_with_a_bounded_bonus(monkeypatch):
-    monkeypatch.setattr(search_module, "lexical_prepass_search", lambda *a, **k: [])
-    monkeypatch.setattr(search_module, "embedding_search", lambda *a, **k: [])
-    monkeypatch.setattr(search_module, "bm25_search", lambda *a, **k: [])
-
-    results = search_module.hybrid_search(
-        "horizontal add of all lanes of a uint8x16_t in neon",
-        None, INTRINSIC_INDEX.rows, None, None, k=5, intrinsic_index=INTRINSIC_INDEX,
-    )
-
-    assert results[0]["metadata"]["intrinsic_name"] == "vaddvq_u8"
-    assert results[0]["score_debug"]["retrieval"]["intrinsic"]["rank"] == 1
-    assert "intrinsic" in results[0]["score_debug"]["retrieval"]["rrf_contributions"]
-    bonus = results[0]["score_debug"]["contributions"]["intrinsic_match"]
-    assert 0 < bonus <= search_module.INTRINSIC_BONUS_WEIGHT
-
-
 def test_bm25_scores_are_computed_once_and_shared():
     rows = [
         {**_metadata(), "chunk_uuid": "a", "search_text": "install docker on ubuntu arm64"},
@@ -787,3 +643,32 @@ def test_bm25_scores_are_computed_once_and_shared():
     prepass_recomputed = search_module.lexical_prepass_search("install docker", rows, bm25_index, k=2)
     assert [r["lexical_prepass_score"] for r in prepass_shared] == [r["lexical_prepass_score"] for r in prepass_recomputed]
     assert all("lexical_exactness_score" in r for r in prepass_shared)
+
+
+@pytest.mark.parametrize("query", ["", "   ", "!!!"])
+def test_public_search_rejects_empty_queries_before_retrieval(monkeypatch, query):
+    def unexpected_retrieval(*args, **kwargs):
+        pytest.fail("Empty queries must not retrieve arbitrary pages")
+
+    monkeypatch.setattr(resources_module, "hybrid_search", unexpected_retrieval)
+    assert resources_module.search(query, _resources([_metadata()])) == []
+
+
+def test_manually_constructed_resources_resolve_compact_window_hits(monkeypatch):
+    parent, window = _windows()
+    compact_window = {key: window[key] for key in (
+        "chunk_uuid", "parent_chunk_uuid", "chunk_index", "chunk_count"
+    )}
+    _patch_retrievers(monkeypatch, dense=[{
+        "metadata": compact_window, "rank": 1, "distance": 0.2
+    }])
+    resources = SearchResources(
+        metadata=[compact_window, parent], embedding_model=None,
+        usearch_index=None, bm25_index=None, include_disclaimers=False,
+    )
+
+    results = resources_module.search("numpy source builds", resources)
+
+    assert len(results) == 1
+    assert results[0]["url"] == parent["url"]
+    assert results[0]["snippet"] == parent["original_text"]
