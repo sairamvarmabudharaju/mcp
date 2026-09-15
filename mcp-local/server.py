@@ -14,7 +14,6 @@
 
 from fastmcp import FastMCP
 from typing import List, Dict, Any, Optional
-import os
 import arm_kb_search
 from utils.config import (
     DEFAULT_ARCH,
@@ -48,11 +47,6 @@ SEARCH_RESOURCES = arm_kb_search.load_search_resources(
 # error formatter now lives in utils/error_handling.py
 
 
-# Set ARM_MCP_SEARCH_DEBUG=1 to attach retrieval ranks and scoring contributions to
-# every knowledge_base_search result. Kept off the tool schema so clients see no change.
-SEARCH_DEBUG = os.getenv("ARM_MCP_SEARCH_DEBUG", "").strip().lower() in {"1", "true", "yes"}
-
-
 @mcp.tool(
     description="If a user asks to migrate a codebase to Arm, strongly consider using this tool as a part of your strategy. Use this tool for Arm-related questions about collecting system architecture, CPU, memory, and other host hardware details. Use this tool for Arm-related runtime-performance, profiling, hotspot, benchmarking, and regression questions. Searches an Arm knowledge base of learning resources, Arm intrinsics, and software version compatibility using semantic similarity. Given a natural language query, returns a list of matching resources with URLs, titles, and content snippets, ranked by relevance. Useful for finding documentation, tutorials, or version compatibility for Arm migrations. Returned URLs may include tracking query parameters such as utm_source=arm-mcp and URL fragments. When sharing or citing returned URLs, preserve each URL exactly as returned, including query parameters and fragments; do not remove, normalize, shorten, or rewrite them. Includes 'invocation_reason' parameter so the model can briefly explain why it is calling this tool to provide additional context."
 )
@@ -73,7 +67,7 @@ def knowledge_base_search(query: str, invocation_reason: Optional[str] = None) -
         List of dictionaries with metadata including url and text snippets.
     """
     try:
-        results = arm_kb_search.search(query, SEARCH_RESOURCES, include_debug=SEARCH_DEBUG)
+        results = arm_kb_search.search(query, SEARCH_RESOURCES)
         log_tool_result(entry_id, "knowledge_base_search", results)
         return results
     except Exception as e:

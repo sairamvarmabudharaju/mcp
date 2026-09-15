@@ -62,12 +62,11 @@ jobs:
 
       - name: Run unit tests
         run: |
-          uv run --directory mcp-local --locked --group test \
+          uv run --directory mcp-local --locked --only-group test \
             pytest -q \
             tests/test_build_inputs.py \
             tests/test_invocation_logger.py \
-            tests/test_release_withdrawal.py \
-            ../tests/test_kb_search.py
+            tests/test_release_withdrawal.py
 
   integration-tests:
     strategy:

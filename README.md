@@ -163,19 +163,6 @@ args = [
 
 After updating the configuration, restart your MCP client to load the Arm MCP server.
 
-### Inspect search scoring
-
-Set `ARM_MCP_SEARCH_DEBUG=1` in the server environment to attach a `debug` object to every `knowledge_base_search` result. The tool schema and the normal response are unchanged when the variable is unset.
-
-The debug payload includes:
-
-- dense, BM25, and lexical-prepass ranks and raw scores
-- each retrieval source's reciprocal-rank-fusion contribution
-- the weighted contribution from every reranking signal
-- query tokens and the selected short- or long-query scoring profile
-- the window that matched when a long chunk was split into several embedding windows
-- candidate counts before fusion and URL deduplication
-
 ## Logging
 
 Depending on usage, the server may write two log files under `/workspace`. With the
