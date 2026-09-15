@@ -87,9 +87,6 @@ GENERIC_ENTITY_TOKENS = (
     | PLATFORM_TOKENS
     | {"app", "application", "guide", "guides", "instance", "web"}
 )
-QUERY_PHRASE_CANONICALIZATIONS = {
-    ("set", "up"): ("setup",),
-}
 VERSIONED_CAPABILITY_PREFIXES = {
     "sme",
     "sve",
@@ -109,60 +106,68 @@ NEGATIVE_SUPPORT_PATTERNS = tuple(
 )
 
 
-def _split_identifier_token(token: str) -> List[str]:
-    """Word parts of an identifier: GoogleChrome -> google, chrome; aws-cli -> aws, cli.
+def tokenize_for_search(text: str) -> List[str]:
+    """Extract complete technical tokens and lowercase them."""
+    return [token.lower() for token in SEARCH_TOKEN_PATTERN.findall(text or "")]
 
-    Single characters are dropped: the ``t`` of ``int8x16_t`` matches everything.
+
+def _identifier_variants(
+    raw_token: str,
+    *,
+    min_part_length: int = 2,
+    include_compact: bool = True,
+) -> List[str]:
+    """Keep the exact token and add word parts and an optional compact alias.
+
+    Queries omit compact aliases; URLs pass lowercase tokens and retain
+    single-character parts. Document identifiers use the defaults.
     """
-    with_camel_boundaries = CAMEL_CASE_BOUNDARY_PATTERN.sub(" ", token or "")
-    return [
+    token = raw_token.lower()
+    with_camel_boundaries = CAMEL_CASE_BOUNDARY_PATTERN.sub(" ", raw_token)
+    parts = [
         part.lower()
         for part in re.split(r"[_\-+.\s]+", with_camel_boundaries)
-        if len(part) > 1
+        if len(part) >= min_part_length
     ]
+    variants = [token]
+    if parts != [token]:
+        variants.extend(parts)
+    if include_compact:
+        compact = TOKEN_SPLIT_PATTERN.sub("", token)
+        if compact and compact != token:
+            variants.append(compact)
+    return variants
 
 
 def _canonicalize_query_phrases(tokens: List[str]) -> List[str]:
+    """Treat the adjacent words 'set up' as 'setup'."""
     canonical: List[str] = []
-    position = 0
-    while position < len(tokens):
-        matched = False
-        for phrase, replacement in QUERY_PHRASE_CANONICALIZATIONS.items():
-            if tuple(tokens[position:position + len(phrase)]) != phrase:
-                continue
-            canonical.extend(replacement)
-            position += len(phrase)
-            matched = True
-            break
-        if not matched:
-            canonical.append(tokens[position])
-            position += 1
+    for token in tokens:
+        if token == "up" and canonical and canonical[-1] == "set":
+            canonical[-1] = "setup"
+        else:
+            canonical.append(token)
     return canonical
 
 
 def normalize_query_for_search(query: str) -> str:
-    """Add the word parts of identifiers (GoogleChrome, aws-cli, int8x16_t) without losing the exact form."""
+    """Expand technical identifiers while treating generic compounds as prose."""
     expanded_tokens: List[str] = []
     for raw_token in SEARCH_TOKEN_PATTERN.findall(query or ""):
-        token = raw_token.lower()
-        boundary_parts = _split_identifier_token(raw_token)
-        if boundary_parts and boundary_parts != [token]:
-            preserve_exact = bool(
-                CAMEL_CASE_BOUNDARY_PATTERN.search(raw_token)
-                or re.search(r"[_+.]", raw_token)
-                or any(character.isdigit() for character in raw_token)
-            )
-            if preserve_exact:
-                expanded_tokens.append(token)
-            expanded_tokens.extend(boundary_parts)
-            continue
-        expanded_tokens.append(token)
+        variants = _identifier_variants(raw_token, include_compact=False)
+        # Keep "pkg-config" for exact lexical matches. Generic phrases such
+        # as "Arm-based" still expand to words without adding a product term.
+        if (
+            len(variants) > 1
+            and not CAMEL_CASE_BOUNDARY_PATTERN.search(raw_token)
+            and not re.search(r"[_+.0-9]", raw_token)
+            and set(variants[1:]) <= GENERIC_ENTITY_TOKENS
+        ):
+            variants = variants[1:]
+        expanded_tokens.extend(variants)
 
-    normalized_tokens: List[str] = []
-    for token in _canonicalize_query_phrases(expanded_tokens):
-        if token not in normalized_tokens:
-            normalized_tokens.append(token)
-    return " ".join(normalized_tokens)
+    tokens = _canonicalize_query_phrases(expanded_tokens)
+    return " ".join(dict.fromkeys(tokens))
 
 
 def _is_google_provider_query(query_tokens: set[str]) -> bool:
@@ -173,35 +178,22 @@ def _is_google_provider_query(query_tokens: set[str]) -> bool:
     )
 
 
-def tokenize_for_search(text: str) -> List[str]:
-    return [token.lower() for token in SEARCH_TOKEN_PATTERN.findall(text or "")]
-
-
 def tokenize_identifier_variants_for_search(text: str) -> List[str]:
     """Keep exact technical tokens and add their safe boundary variants."""
-    tokens: List[str] = []
-    for raw_token in SEARCH_TOKEN_PATTERN.findall(text or ""):
-        token = raw_token.lower()
-        tokens.append(token)
-        boundary_parts = _split_identifier_token(raw_token)
-        if boundary_parts != [token]:
-            tokens.extend(boundary_parts)
-        compact_token = TOKEN_SPLIT_PATTERN.sub("", token)
-        if compact_token and compact_token != token:
-            tokens.append(compact_token)
-    return tokens
+    return [
+        variant
+        for raw_token in SEARCH_TOKEN_PATTERN.findall(text or "")
+        for variant in _identifier_variants(raw_token)
+    ]
 
 
 def tokenize_url_for_search(text: str) -> List[str]:
-    tokens: List[str] = []
-    for token in tokenize_for_search(text):
-        tokens.append(token)
-        if TOKEN_SPLIT_PATTERN.search(token):
-            tokens.extend(part for part in TOKEN_SPLIT_PATTERN.split(token) if part)
-            compact_token = TOKEN_SPLIT_PATTERN.sub("", token)
-            if compact_token:
-                tokens.append(compact_token)
-    return tokens
+    """Expand URL tokens without camel-case splitting or dropping short parts."""
+    return [
+        variant
+        for token in tokenize_for_search(text)
+        for variant in _identifier_variants(token, min_part_length=1)
+    ]
 
 
 def tokenize_url_content_for_search(text: str) -> List[str]:
@@ -304,7 +296,8 @@ def _support_evidence_score(query_tokens: set[str], text_tokens: set[str], text:
     return score
 
 
-def _lexical_prepass_score(query: str, metadata: Dict[str, Any], bm25_score: float) -> float:
+def _lexical_exactness_score(query: str, metadata: Dict[str, Any]) -> float:
+    """Score field overlap, phrases, and support evidence independently of BM25."""
     query_tokens = set(tokenize_for_search(query))
     salient_query_tokens = set(salient_tokens(query))
     if not query_tokens:
@@ -346,8 +339,7 @@ def _lexical_prepass_score(query: str, metadata: Dict[str, Any], bm25_score: flo
             phrase_bonus += 0.12
 
     support_bonus = _support_evidence_score(query_tokens, all_tokens, all_text)
-    sparse_score = min(1.0, bm25_score / 25.0)
-    return sparse_score + weighted_overlap + phrase_bonus + support_bonus
+    return weighted_overlap + phrase_bonus + support_bonus
 
 
 def lexical_prepass_search(
@@ -365,7 +357,7 @@ def lexical_prepass_search(
         return []
     scored_candidates: List[Dict[str, Any]] = []
     for candidate in candidates:
-        exactness = _lexical_prepass_score(query, candidate["metadata"], 0.0)
+        exactness = _lexical_exactness_score(query, candidate["metadata"])
         lexical_score = exactness + min(1.0, candidate.get("bm25_score", 0.0) / 25.0)
         if lexical_score <= 0:
             continue
@@ -423,21 +415,31 @@ def _sparse_document_tokens(metadata: Dict[str, Any]) -> List[str]:
     return tokens
 
 
-def build_bm25_index(metadata: List[Dict]) -> Optional[ParentAwareBM25]:
-    representative_indices: Dict[str, int] = {}
-    ungrouped_indices: List[int] = []
+def _parent_chunk_key(metadata: Dict[str, Any]) -> str:
+    return str(metadata.get("parent_chunk_uuid") or metadata.get("chunk_uuid") or "")
+
+
+def _parent_representative_indices(metadata: List[Dict]) -> Dict[str, int]:
+    """Choose one row per parent, preferring window 1 when present."""
+    representatives: Dict[str, int] = {}
     for index, item in enumerate(metadata):
         parent_key = _parent_chunk_key(item)
         if not parent_key:
-            ungrouped_indices.append(index)
             continue
-        existing_index = representative_indices.get(parent_key)
+        existing_index = representatives.get(parent_key)
         if existing_index is None or (
             item.get("chunk_index", 1) == 1
             and metadata[existing_index].get("chunk_index", 1) != 1
         ):
-            representative_indices[parent_key] = index
+            representatives[parent_key] = index
+    return representatives
 
+
+def build_bm25_index(metadata: List[Dict]) -> Optional[ParentAwareBM25]:
+    representative_indices = _parent_representative_indices(metadata)
+    ungrouped_indices = [
+        index for index, item in enumerate(metadata) if not _parent_chunk_key(item)
+    ]
     metadata_indices = sorted([*ungrouped_indices, *representative_indices.values()])
     corpus = [_sparse_document_tokens(metadata[index]) for index in metadata_indices]
     if not any(corpus):
@@ -445,21 +447,12 @@ def build_bm25_index(metadata: List[Dict]) -> Optional[ParentAwareBM25]:
     return ParentAwareBM25(corpus, metadata_indices, len(metadata))
 
 
-def _parent_chunk_key(metadata: Dict[str, Any]) -> str:
-    return str(metadata.get("parent_chunk_uuid") or metadata.get("chunk_uuid") or "")
-
-
 def build_parent_index(metadata: List[Dict]) -> Dict[str, Dict[str, Any]]:
-    """Map each parent key to its representative row: the first window, which carries the full text."""
-    parent_index: Dict[str, Dict[str, Any]] = {}
-    for item in metadata:
-        parent_key = _parent_chunk_key(item)
-        if not parent_key:
-            continue
-        existing = parent_index.get(parent_key)
-        if existing is None or (item.get("chunk_index", 1) == 1 and existing.get("chunk_index", 1) != 1):
-            parent_index[parent_key] = item
-    return parent_index
+    """Map each parent key to its representative row carrying the full text."""
+    return {
+        parent_key: metadata[index]
+        for parent_key, index in _parent_representative_indices(metadata).items()
+    }
 
 
 def _resolve_parent_representative(candidate: Dict[str, Any], parent_index: Dict[str, Dict[str, Any]]) -> None:
@@ -473,11 +466,11 @@ def _resolve_parent_representative(candidate: Dict[str, Any], parent_index: Dict
     representative = parent_index.get(_parent_chunk_key(metadata))
     if representative is None or representative is metadata:
         return
-    candidate["matched_window"] = {
+    candidate.setdefault("matched_window", {
         "chunk_uuid": metadata.get("chunk_uuid"),
         "chunk_index": metadata.get("chunk_index"),
         "chunk_count": metadata.get("chunk_count"),
-    }
+    })
     candidate["metadata"] = representative
 
 
@@ -709,7 +702,7 @@ def rerank_candidates(
         # the prepass already scored reuse that value.
         lexical_exactness_score = candidate.get("lexical_exactness_score")
         if lexical_exactness_score is None:
-            lexical_exactness_score = _lexical_prepass_score(query, metadata, 0.0)
+            lexical_exactness_score = _lexical_exactness_score(query, metadata)
         lexical_prepass_bonus = min(1.0, lexical_exactness_score / 2.0)
         if candidate.get("pinned_lexical"):
             lexical_prepass_bonus += 1 / (RRF_K + candidate.get("lexical_prepass_rank", RRF_K))
@@ -842,6 +835,8 @@ def hybrid_search(
     """Fuse lexical, dense and BM25 candidates per parent chunk and rerank them."""
     if not tokenize_for_search(query):
         return []
+    if parent_index is None:
+        parent_index = build_parent_index(metadata)
     candidate_depth = candidate_depth or max(k * 20, 100)
     bm25_scores = bm25_query_scores(query, bm25_index)
     lexical_results = lexical_prepass_search(
@@ -866,8 +861,12 @@ def hybrid_search(
         }
 
     for result in dense_results:
+        # Capture the matching window before merging with a lexical parent.
+        _resolve_parent_representative(result, parent_index)
         candidate_key = _candidate_key(result)
         existing = candidates.get(candidate_key, {"metadata": result["metadata"], "rrf_score": 0.0})
+        if "matched_window" in result:
+            existing["matched_window"] = result["matched_window"]
         existing["rank"] = min(existing.get("rank", result["rank"]), result["rank"])
         existing["dense_rank"] = result["rank"]
         existing["dense_raw_rank"] = result.get("raw_rank", result["rank"])
