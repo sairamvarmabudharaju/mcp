@@ -1,0 +1,378 @@
+{
+  "version": "1.0",
+  "created": "2026-09-14",
+  "review_status": "targeted-acceptance",
+  "source": "Thirty production-path queries assembled from the Docker and Android Whisper attachments, explicit Jira acceptance queries, and consistency variants.",
+  "items": [
+    {
+      "id": "HM001",
+      "query": "How do I install Docker on my Ubuntu Graviton machine?",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM002",
+      "query": "how do i install docker on arm",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM003",
+      "query": "docker install guide",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM004",
+      "query": "How can I install Docker on Ubuntu Arm64?",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM005",
+      "query": "Install Docker Engine on AWS Graviton",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM006",
+      "query": "Set up Docker on an Arm-based EC2 instance",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM007",
+      "query": "What are the steps to install Docker on Arm Linux?",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM008",
+      "query": "Docker installation instructions for Ubuntu on Arm",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM009",
+      "query": "How do I set up Docker Engine on a Graviton server?",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM010",
+      "query": "Where is the Arm Docker installation guide?",
+      "group": "docker_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/docker/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM011",
+      "query": "How do I run a Whisper model on my Android phone?",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM012",
+      "query": "How do I run Whisper on Android?",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM013",
+      "query": "Whisper Android Learning Path",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM014",
+      "query": "Run OpenAI Whisper on an Android phone",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM015",
+      "query": "How can I deploy a Whisper speech model to Android?",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM016",
+      "query": "Whisper model inference on Android Arm",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM017",
+      "query": "What is the Arm guide for running Whisper on Android?",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM018",
+      "query": "Set up Whisper speech recognition on my Android device",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM019",
+      "query": "How do I use Whisper for transcription on an Arm phone?",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM020",
+      "query": "Where is the Whisper Learning Path for Android?",
+      "group": "whisper_attachment",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/mobile-graphics-and-gaming/ai-portal-audio-to-text/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM021",
+      "query": "How do I run awscli on arm",
+      "group": "jira_explicit",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/aws-cli/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM022",
+      "query": "How do I install awscli?",
+      "group": "jira_explicit",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/aws-cli/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM023",
+      "query": "How do I run my web app on a graviton instance?",
+      "group": "jira_explicit",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/servers-and-cloud-computing/aws-copilot/",
+          "match": "prefix",
+          "grade": 2
+        },
+        {
+          "url": "https://learn.arm.com/learning-paths/servers-and-cloud-computing/ecs/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM024",
+      "query": "Give me an install guide for Google Chrome",
+      "group": "jira_explicit",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/browsers/chrome/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM025",
+      "query": "How do I install AWS CLI on Arm?",
+      "group": "consistency_variants",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/aws-cli/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM026",
+      "query": "aws cli install guide",
+      "group": "consistency_variants",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/aws-cli/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM027",
+      "query": "AWSCLI ARM64 setup",
+      "group": "consistency_variants",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/aws-cli/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM028",
+      "query": "google chrome arm install",
+      "group": "consistency_variants",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/browsers/chrome/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM029",
+      "query": "GoogleChrome installation guide",
+      "group": "consistency_variants",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/install-guides/browsers/chrome/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    },
+    {
+      "id": "HM030",
+      "query": "deploy a web app to AWS Graviton",
+      "group": "consistency_variants",
+      "expected": [
+        {
+          "url": "https://learn.arm.com/learning-paths/servers-and-cloud-computing/aws-copilot/",
+          "match": "prefix",
+          "grade": 2
+        },
+        {
+          "url": "https://learn.arm.com/learning-paths/servers-and-cloud-computing/ecs/",
+          "match": "prefix",
+          "grade": 2
+        }
+      ]
+    }
+  ]
+}

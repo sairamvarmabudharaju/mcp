@@ -11,6 +11,7 @@ on:
       - embedding-generation/document_chunking.py
       - embedding-generation/embedding-model.lock.json
       - embedding-generation/generate-chunks.py
+      - embedding-generation/intrinsic_taxonomy.py
       - embedding-generation/local_vectorstore_creation.py
       - embedding-generation/pyproject.toml
       - embedding-generation/uv.lock

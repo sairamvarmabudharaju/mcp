@@ -515,6 +515,73 @@ class TestSourceTracking:
         assert result is False
         assert len(gc.all_sources) == 1
 
+    def test_register_source_can_refresh_existing_discovery_metadata(self, gc):
+        gc.register_source(
+            site_name="Install Guides",
+            license_type="CC4.0",
+            display_name="Old title",
+            url="https://learn.arm.com/install-guides/example/",
+            keywords="old",
+            transcript_source_url="https://example.com/transcript",
+        )
+
+        result = gc.register_source(
+            site_name="Install Guides",
+            license_type="CC4.0",
+            display_name="Install Guide - Current title",
+            url="https://learn.arm.com/install-guides/example/",
+            keywords=["Current title", "install"],
+            update_existing=True,
+        )
+
+        assert result is False
+        assert len(gc.all_sources) == 1
+        assert gc.all_sources[0]["display_name"] == "Install Guide - Current title"
+        assert gc.all_sources[0]["keywords"] == "Current title; install"
+        assert (
+            gc.all_sources[0]["transcript_source_url"]
+            == "https://example.com/transcript"
+        )
+
+    def test_prune_stale_sources_is_scoped_to_managed_site_and_prefix(self, gc):
+        gc.all_sources = [
+            {
+                "site_name": "Install Guides",
+                "url": "https://learn.arm.com/install-guides/current/",
+            },
+            {
+                "site_name": "Install Guides",
+                "url": "https://learn.arm.com/install-guides/stale/",
+            },
+            {
+                "site_name": "Learning Paths",
+                "url": "https://learn.arm.com/install-guides/manual-reference/",
+            },
+            {
+                "site_name": "Install Guides",
+                "url": "https://example.com/install-guides/external/",
+            },
+        ]
+        gc.known_source_urls = {source["url"] for source in gc.all_sources}
+
+        removed = gc.prune_stale_sources(
+            "Install Guides",
+            {"https://learn.arm.com/install-guides/current/"},
+            "https://learn.arm.com/install-guides/",
+        )
+
+        assert removed == ["https://learn.arm.com/install-guides/stale/"]
+        assert {source["url"] for source in gc.all_sources} == {
+            "https://learn.arm.com/install-guides/current/",
+            "https://learn.arm.com/install-guides/manual-reference/",
+            "https://example.com/install-guides/external/",
+        }
+        assert gc.known_source_urls == {
+            "https://learn.arm.com/install-guides/current/",
+            "https://learn.arm.com/install-guides/manual-reference/",
+            "https://example.com/install-guides/external/",
+        }
+
     def test_register_source_inserts_after_matching_site_group(self, gc):
         """Test that new sources stay grouped with existing sources from the same site."""
         gc.all_sources = [
@@ -613,6 +680,20 @@ class TestSourceTracking:
         assert "https://example.com/2" in gc.known_source_urls
         assert gc.all_sources[0]["site_name"] == "Test Site"
         assert gc.all_sources[1]["display_name"] == "Another Display"
+
+    def test_load_existing_sources_deduplicates_urls(self, gc, tmp_path):
+        csv_file = tmp_path / "sources.csv"
+        csv_file.write_text(
+            "Site Name,License Type,Display Name,URL,Keywords\n"
+            "Install Guides,CC4.0,First,https://example.com/guide/,first\n"
+            "Install Guides,CC4.0,Duplicate,https://example.com/guide/,duplicate\n"
+        )
+
+        gc.load_existing_sources(str(csv_file))
+
+        assert len(gc.all_sources) == 1
+        assert gc.all_sources[0]["display_name"] == "First"
+        assert gc.known_source_urls == {"https://example.com/guide/"}
 
     def test_save_sources_csv(self, gc, tmp_path):
         """Test saving sources to CSV file."""
@@ -750,6 +831,143 @@ class TestSourceTracking:
         assert len(gc.all_sources) == 2
         assert "https://example.com/test" in gc.known_source_urls
         assert gc.known_source_urls == {"https://example.com/test", "https://new.example.com"}
+
+
+class TestInstallGuideDiscovery:
+    def test_multi_install_children_are_registered_when_parent_already_exists(
+        self, gc, monkeypatch
+    ):
+        gc.register_source(
+            site_name="Install Guides",
+            license_type="CC4.0",
+            display_name="Old browsers title",
+            url="https://learn.arm.com/install-guides/browsers/",
+            keywords="old",
+        )
+        gc.register_source(
+            site_name="Install Guides",
+            license_type="CC4.0",
+            display_name="Removed guide",
+            url="https://learn.arm.com/install-guides/removed/",
+            keywords="removed",
+        )
+        responses = {
+            "https://learn.arm.com/install-guides": (
+                '<ads-card class="tool-card" '
+                'link="/install-guides/browsers/"></ads-card>'
+            ),
+            "https://learn.arm.com/install-guides/browsers/": (
+                '<h1 id="install-guide-title">Browsers on Arm</h1>'
+                '<ads-card class="multi-install-card" '
+                'link="/install-guides/browsers/chrome/">'
+                '<span class="multi-tool-selection-title">Chrome</span>'
+                "</ads-card>"
+                '<ads-card class="multi-install-card" '
+                'link="/install-guides/browsers/firefox/">'
+                '<span class="multi-tool-selection-title">Firefox</span>'
+                "</ads-card>"
+            ),
+        }
+
+        def fake_get(url, timeout):
+            return SimpleNamespace(text=responses[url], content=responses[url].encode("utf-8"))
+
+        monkeypatch.setattr(gc.http_session, "get", fake_get)
+
+        gc.processLearningPath("/install-guides", "Install Guide", emit_chunks=False)
+
+        sources_by_url = {source["url"]: source for source in gc.all_sources}
+        parent = sources_by_url["https://learn.arm.com/install-guides/browsers/"]
+        assert parent["display_name"] == "Install Guide - Browsers on Arm"
+        assert parent["keywords"] == "Browsers on Arm; install; build; download"
+        assert "https://learn.arm.com/install-guides/removed/" not in sources_by_url
+
+        chrome = sources_by_url[
+            "https://learn.arm.com/install-guides/browsers/chrome/"
+        ]
+        assert chrome["display_name"] == "Install Guide - Chrome"
+        assert chrome["keywords"] == (
+            "Chrome; Browsers on Arm; install; build; download"
+        )
+        assert "https://learn.arm.com/install-guides/browsers/firefox/" in sources_by_url
+
+    def test_incomplete_install_catalog_does_not_prune_existing_sources(
+        self, gc, monkeypatch
+    ):
+        gc.register_source(
+            site_name="Install Guides",
+            license_type="CC4.0",
+            display_name="Install Guide - Existing",
+            url="https://learn.arm.com/install-guides/existing/",
+            keywords="existing",
+        )
+        responses = {
+            "https://learn.arm.com/install-guides": SimpleNamespace(
+                text=(
+                    '<ads-card class="tool-card" '
+                    'link="/install-guides/broken/"></ads-card>'
+                ),
+                content=(
+                    b'<ads-card class="tool-card" '
+                    b'link="/install-guides/broken/"></ads-card>'
+                ),
+                ok=True,
+            ),
+            "https://learn.arm.com/install-guides/broken/": SimpleNamespace(
+                text="<html>temporarily incomplete</html>",
+                content=b"<html>temporarily incomplete</html>",
+                ok=True,
+            ),
+        }
+
+        def fake_get(url, timeout):
+            return responses[url]
+
+        monkeypatch.setattr(gc.http_session, "get", fake_get)
+
+        gc.processLearningPath("/install-guides", "Install Guide", emit_chunks=False)
+
+        assert {
+            source["url"] for source in gc.all_sources
+        } == {"https://learn.arm.com/install-guides/existing/"}
+
+    def test_discovered_children_are_chunked_in_the_same_run(
+        self, gc, monkeypatch, tmp_path
+    ):
+        sources_file = tmp_path / "sources.csv"
+        sources_file.write_text(
+            "Site Name,License Type,Display Name,URL,Keywords,Transcript Source URL\n"
+        )
+        yaml_dir = tmp_path / "yaml_data"
+        details_file = tmp_path / "info" / "chunk_details.csv"
+        monkeypatch.setattr(gc.sys, "argv", ["generate-chunks.py", str(sources_file)])
+        monkeypatch.setattr(gc, "yaml_dir", str(yaml_dir))
+        monkeypatch.setattr(gc, "details_file", str(details_file))
+
+        def discover_install_guides(emit_chunks):
+            gc.register_source(
+                site_name="Install Guides",
+                license_type="CC4.0",
+                display_name="Install Guide - Chrome",
+                url="https://learn.arm.com/install-guides/browsers/chrome/",
+                keywords=["Chrome", "Browsers on Arm", "install"],
+            )
+
+        processed_urls = []
+
+        def fake_create_chunks(url, *args):
+            processed_urls.append(url)
+            return []
+
+        monkeypatch.setattr(gc, "createLearningPathChunks", discover_install_guides)
+        monkeypatch.setattr(gc, "createEcosystemDashboardChunks", lambda emit_chunks: None)
+        monkeypatch.setattr(gc, "create_chunks_for_source", fake_create_chunks)
+
+        gc.main()
+
+        assert processed_urls == [
+            "https://learn.arm.com/install-guides/browsers/chrome/"
+        ]
 
 
 class TestGetMarkdownGitHubURLsFromPage:
