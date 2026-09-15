@@ -25,6 +25,8 @@ import yaml
 from sentence_transformers import SentenceTransformer
 from usearch.index import Index
 
+from intrinsic_taxonomy import enrich_intrinsic_record, is_intrinsic_record
+
 EMBEDDING_WINDOW_OVERLAP_TOKENS = 32
 MAX_EMBEDDING_CONTEXT_TOKENS = 64
 EMBEDDING_TOKEN_SAFETY_MARGIN = 2
@@ -203,7 +205,7 @@ def _content_body(content: str) -> str:
 def _embedding_window_policy(yaml_content: dict) -> str:
     """Use one dense vector for self-identifying records such as intrinsics."""
     chunk_uuid = str(yaml_content.get("chunk_uuid", ""))
-    if chunk_uuid.startswith(SINGLE_WINDOW_CHUNK_PREFIXES):
+    if chunk_uuid.startswith(SINGLE_WINDOW_CHUNK_PREFIXES) or is_intrinsic_record(yaml_content):
         return "single_context_window"
     return "lossless_overlap"
 
@@ -270,6 +272,11 @@ def _metadata_for_window(
         "version": yaml_content.get("version", ""),
         "content_type": yaml_content.get("content_type", ""),
         "search_text": search_text,
+        **{
+            key: value
+            for key, value in yaml_content.items()
+            if key.startswith("intrinsic_") and key != "intrinsic_embedding_text"
+        },
     }
 
 
@@ -334,10 +341,16 @@ def prepare_embedding_records(
     contents = []
     metadata = []
     trimmed_windows = 0
-    for yaml_content in yaml_contents:
+    for source_yaml_content in yaml_contents:
+        yaml_content = source_yaml_content
+        intrinsic_embedding_text = ""
+        if is_intrinsic_record(source_yaml_content):
+            enrichment = enrich_intrinsic_record(source_yaml_content)
+            yaml_content = {**source_yaml_content, **enrichment}
+            intrinsic_embedding_text = enrichment["intrinsic_embedding_text"]
         source_content = yaml_content["content"]
-        body = _content_body(source_content)
-        context = _embedding_context(yaml_content, tokenizer)
+        body = intrinsic_embedding_text or _content_body(source_content)
+        context = "" if intrinsic_embedding_text else _embedding_context(yaml_content, tokenizer)
         separator = "\n\n" if context and body else ""
         context_token_count = len(
             tokenizer(
@@ -355,6 +368,20 @@ def prepare_embedding_records(
         )
         parent_chunk_uuid = yaml_content["chunk_uuid"]
         embedding_window_policy = _embedding_window_policy(yaml_content)
+        if intrinsic_embedding_text:
+            critical_fields = intrinsic_embedding_text.split("\nBehavior:", 1)[0]
+            critical_token_count = len(
+                tokenizer(
+                    critical_fields,
+                    add_special_tokens=True,
+                    truncation=False,
+                    padding=False,
+                )["input_ids"]
+            )
+            if critical_token_count > max_seq_length:
+                raise ValueError(
+                    f"Critical intrinsic fields exceed the model token limit for {parent_chunk_uuid}"
+                )
         while True:
             spans = _window_spans(tokenizer, body, body_budget, overlap_tokens)
             if embedding_window_policy == "single_context_window":
@@ -420,7 +447,11 @@ def prepare_embedding_records(
             if chunk_count > 1:
                 chunk_uuid = f"{parent_chunk_uuid}__window_{chunk_index}_of_{chunk_count}"
             original_text = source_content if chunk_index == 1 else ""
-            search_text_content = source_content if chunk_index == 1 else ""
+            search_text_content = (
+                f"{intrinsic_embedding_text}\n{source_content}"
+                if intrinsic_embedding_text and chunk_index == 1
+                else source_content if chunk_index == 1 else ""
+            )
             contents.append(embedding_text)
             metadata.append(
                 _metadata_for_window(

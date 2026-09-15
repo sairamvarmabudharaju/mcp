@@ -25,5 +25,6 @@
 !acquire-model.py
 !document_chunking.py
 !generate-chunks.py
+!intrinsic_taxonomy.py
 !local_vectorstore_creation.py
 !vector-db-sources.csv

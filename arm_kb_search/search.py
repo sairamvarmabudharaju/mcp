@@ -24,8 +24,13 @@ from sentence_transformers import SentenceTransformer
 from usearch.index import Index
 
 from .config import DENSE_SEARCH_EXACT, DISTANCE_THRESHOLD, K_RESULTS
+from .intrinsic_search import (
+    analyze_intrinsic_query,
+    intrinsic_candidate_search,
+    intrinsic_score_components,
+)
 
-SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_\-+.]*", re.IGNORECASE)
+SEARCH_TOKEN_PATTERN = re.compile(r"(?:_+)?[a-z0-9][a-z0-9_\-+.]*", re.IGNORECASE)
 TOKEN_SPLIT_PATTERN = re.compile(r"[_\-+.]+")
 CAMEL_CASE_BOUNDARY_PATTERN = re.compile(
     r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
@@ -701,6 +706,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
     query_tokens = set(tokenize_for_search(query))
     if not query_tokens:
         return candidates
+    intrinsic_analysis = analyze_intrinsic_query(query)
     salient_query_tokens = set(salient_tokens(query))
     direct_query_terms = direct_intent_tokens(query)
     direct_query_tokens = set(direct_query_terms)
@@ -715,6 +721,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         "salient_tokens": sorted(salient_query_tokens),
         "scoring_tokens": sorted(scoring_query_tokens),
         "entity_tokens": sorted(entity_query_tokens),
+        "intrinsic": intrinsic_analysis,
     }
 
     reranked: List[Dict[str, Any]] = []
@@ -799,6 +806,8 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
         lexical_prepass_bonus = min(1.0, lexical_exactness_score / 2.0)
         if candidate.get("pinned_lexical"):
             lexical_prepass_bonus += 1 / (RRF_K + candidate.get("lexical_prepass_rank", RRF_K))
+        intrinsic_components = intrinsic_score_components(intrinsic_analysis, metadata)
+        intrinsic_bonus = sum(intrinsic_components.values())
         doc_type_bonus = 0.0
         compiler_guide_query = bool((query_tokens & COMPILER_GUIDE_TOKENS) and "guide" in query_tokens)
         if prefers_tuning_guide and not compiler_guide_query:
@@ -848,6 +857,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
                 "dashboard_package_match": dashboard_package_bonus,
                 "parent_learning_path": parent_learning_path_bonus,
                 "document_type": doc_type_bonus,
+                "intrinsic_structure": intrinsic_bonus,
                 "shallow_overlap_penalty": -shallow_overlap_penalty,
             }
         else:
@@ -873,6 +883,7 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
                 "dashboard_package_match": dashboard_package_bonus,
                 "exact_entity": exact_entity_bonus,
                 "document_type": doc_type_bonus,
+                "intrinsic_structure": intrinsic_bonus,
             }
         rerank_score = sum(contributions.values())
         score_debug = {
@@ -893,6 +904,11 @@ def rerank_candidates(query: str, candidates: List[Dict[str, Any]]) -> List[Dict
                     "rank": candidate.get("lexical_prepass_rank"),
                     "raw_score": candidate.get("lexical_prepass_score"),
                     "pinned": bool(candidate.get("pinned_lexical")),
+                },
+                "intrinsic": {
+                    "rank": candidate.get("intrinsic_rank"),
+                    "raw_score": candidate.get("intrinsic_score"),
+                    "components": intrinsic_components,
                 },
                 "rrf_contributions": candidate.get("rrf_contributions", {}),
                 "matched_window": candidate.get("matched_window"),
@@ -936,6 +952,9 @@ def hybrid_search(
         k=max(k * 3, PINNED_LEXICAL_CANDIDATES),
         candidate_depth=max(candidate_depth, LEXICAL_PREPASS_DEPTH),
     )
+    intrinsic_results = intrinsic_candidate_search(
+        query, metadata, max(candidate_depth, PINNED_LEXICAL_CANDIDATES)
+    )
     dense_results = embedding_search(query, usearch_index, metadata, embedding_model, candidate_depth)
     sparse_results = bm25_search(query, metadata, bm25_index, candidate_depth)
 
@@ -948,6 +967,19 @@ def hybrid_search(
             "rrf_score": lexical_rrf,
             "rrf_contributions": {"lexical_prepass": lexical_rrf},
         }
+
+    for result in intrinsic_results:
+        candidate_key = _candidate_key(result)
+        existing = candidates.get(
+            candidate_key, {"metadata": result["metadata"], "rrf_score": 0.0}
+        )
+        existing["intrinsic_rank"] = result["intrinsic_rank"]
+        existing["intrinsic_score"] = result["intrinsic_score"]
+        existing["intrinsic_components"] = result["intrinsic_components"]
+        intrinsic_rrf = 1 / (RRF_K + result["intrinsic_rank"])
+        existing["rrf_score"] += intrinsic_rrf
+        existing.setdefault("rrf_contributions", {})["intrinsic"] = intrinsic_rrf
+        candidates[candidate_key] = existing
 
     for result in dense_results:
         candidate_key = _candidate_key(result)
@@ -980,6 +1012,7 @@ def hybrid_search(
     pipeline_debug = {
         "candidate_depth": candidate_depth,
         "lexical_candidates": len(lexical_results),
+        "intrinsic_candidates": len(intrinsic_results),
         "dense_candidates": len(dense_results),
         "bm25_candidates": len(sparse_results),
         "fused_candidates": len(candidates),

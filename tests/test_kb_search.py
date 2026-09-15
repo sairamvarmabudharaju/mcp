@@ -71,6 +71,7 @@ def _candidate(metadata: dict) -> dict:
 
 def _patch_retrievers(monkeypatch, lexical=(), dense=(), sparse=()):
     monkeypatch.setattr(search_module, "lexical_prepass_search", lambda *a, **k: list(lexical))
+    monkeypatch.setattr(search_module, "intrinsic_candidate_search", lambda *a, **k: [])
     monkeypatch.setattr(search_module, "embedding_search", lambda *a, **k: list(dense))
     monkeypatch.setattr(search_module, "bm25_search", lambda *a, **k: list(sparse))
 
@@ -126,6 +127,14 @@ def test_query_normalization_preserves_compact_technical_identifiers():
 
     assert normalized == "tensorflow tensor flow int8x16_t int8x16 t"
 
+
+def test_query_normalization_preserves_leading_underscore_identifiers():
+    assert search_module.normalize_query_for_search(
+        "_mm_shuffle_epi8", {}
+    ) == "_mm_shuffle_epi8 mm shuffle epi8"
+    assert search_module.normalize_query_for_search(
+        "__crc32b", {}
+    ) == "__crc32b crc32b"
 
 
 def test_query_normalization_canonicalizes_general_setup_phrase():
@@ -235,6 +244,7 @@ def test_hybrid_search_records_retrieval_ranks_and_score_contributions(monkeypat
     assert debug["pipeline"] == {
         "candidate_depth": 25,
         "lexical_candidates": 1,
+        "intrinsic_candidates": 0,
         "dense_candidates": 1,
         "bm25_candidates": 1,
         "fused_candidates": 1,
@@ -690,3 +700,209 @@ def test_dashboard_bonus_ignores_generic_query_tokens():
     ranked = search_module.rerank_candidates("geekbench on arm server", [_dashboard("mongodb-enterprise-server")])
 
     assert ranked[0]["score_debug"]["contributions"]["dashboard_package_match"] == 0.0
+
+
+# --- intrinsic-aware retrieval ----------------------------------------------
+
+
+def _intrinsic_metadata(
+    name: str,
+    operation: str,
+    *,
+    isa: str = "Neon",
+    input_types=(),
+    output_type="float32x4_t",
+    output_shape="vector",
+    lanes=(),
+    widths=(),
+    bits=(32,),
+    signedness=("floating-point",),
+    memory="No memory access.",
+) -> dict:
+    return {
+        **_metadata(),
+        "chunk_uuid": f"intrinsic-{name}",
+        "url": f"https://developer.arm.com/architectures/instruction-sets/intrinsics/#q={name}",
+        "title": f"Arm Intrinsics - {name}",
+        "doc_type": "Intrinsic",
+        "intrinsic_taxonomy_version": "1.0.0",
+        "intrinsic_name": name,
+        "intrinsic_isa": isa,
+        "intrinsic_operation": operation,
+        "intrinsic_aliases": [operation.replace("_", " ")],
+        "intrinsic_input_types": list(input_types),
+        "intrinsic_output_type": output_type,
+        "intrinsic_output_shape": output_shape,
+        "intrinsic_lane_counts": list(lanes),
+        "intrinsic_vector_width_bits": list(widths),
+        "intrinsic_element_bits": list(bits),
+        "intrinsic_signedness": list(signedness),
+        "intrinsic_memory_behavior": memory,
+    }
+
+
+@pytest.mark.parametrize(
+    ("query", "expected", "expected_fields", "decoy", "decoy_fields"),
+    [
+        (
+            "how to do a horizontal add of all lanes of a uint8x16_t in neon",
+            "vaddvq_u8",
+            dict(
+                operation="reduction_add", input_types=("uint8x16_t",),
+                output_type="uint8_t", output_shape="scalar", lanes=(16,),
+                widths=(128,), bits=(8,), signedness=("unsigned",),
+            ),
+            "vld1q_dup_u8",
+            dict(
+                operation="duplicate", input_types=("uint8_t",),
+                output_type="uint8x16_t", lanes=(16,), widths=(128,),
+                bits=(8,), signedness=("unsigned",),
+                memory="Reads contiguous data from memory.",
+            ),
+        ),
+        (
+            "load 4 floats from memory into a neon register",
+            "vld1q_f32",
+            dict(
+                operation="load", input_types=("float32_t",), lanes=(4,),
+                widths=(128,), memory="Reads contiguous data from memory.",
+            ),
+            "vdupq_n_f32",
+            dict(operation="duplicate", lanes=(4,), widths=(128,)),
+        ),
+        (
+            "sve intrinsic to create an all-true predicate",
+            "svptrue_b32",
+            dict(
+                operation="predicate_all_true", isa="SVE",
+                output_type="svbool_t", output_shape="predicate",
+                bits=(), signedness=(),
+            ),
+            "svwhilelt_b32",
+            dict(
+                operation="predicate", isa="SVE", output_type="svbool_t",
+                output_shape="predicate", bits=(), signedness=(),
+            ),
+        ),
+        (
+            "fused multiply add neon float32",
+            "vfmaq_f32",
+            dict(operation="fused_multiply_add"),
+            "vmulq_f32",
+            dict(operation="multiply"),
+        ),
+        (
+            "reinterpret int8x16_t as uint8x16_t neon",
+            "vreinterpretq_u8_s8",
+            dict(
+                operation="reinterpret", input_types=("int8x16_t",),
+                output_type="uint8x16_t", lanes=(16,), widths=(128,),
+                bits=(8,), signedness=("signed", "unsigned"),
+            ),
+            "vaddq_s8",
+            dict(
+                operation="add", input_types=("int8x16_t", "int8x16_t"),
+                output_type="int8x16_t", lanes=(16,), widths=(128,),
+                bits=(8,), signedness=("signed",),
+            ),
+        ),
+        (
+            "neon intrinsic to multiply two float32x4_t vectors",
+            "vmulq_f32",
+            dict(
+                operation="multiply", input_types=("float32x4_t", "float32x4_t"),
+                lanes=(4,), widths=(128,),
+            ),
+            "vfmaq_f32",
+            dict(operation="fused_multiply_add", lanes=(4,), widths=(128,)),
+        ),
+        (
+            "sve multiply-accumulate intrinsic",
+            "svmla_f32",
+            dict(operation="multiply_accumulate", isa="SVE"),
+            "svmul_f32",
+            dict(operation="multiply", isa="SVE"),
+        ),
+        (
+            "what's the arm equivalent of _mm_shuffle_epi8",
+            "vqtbl1q_u8",
+            dict(
+                operation="table_lookup", input_types=("uint8x16_t",),
+                output_type="uint8x16_t", lanes=(16,), widths=(128,),
+                bits=(8,), signedness=("unsigned",),
+            ),
+            "vzip1q_u8",
+            dict(
+                operation="zip", input_types=("uint8x16_t", "uint8x16_t"),
+                output_type="uint8x16_t", lanes=(16,), widths=(128,),
+                bits=(8,), signedness=("unsigned",),
+            ),
+        ),
+    ],
+)
+def test_intrinsic_structured_retrieval_covers_operation_families(
+    query, expected, expected_fields, decoy, decoy_fields
+):
+    expected_metadata = _intrinsic_metadata(expected, **expected_fields)
+    decoy_metadata = _intrinsic_metadata(decoy, **decoy_fields)
+
+    results = search_module.intrinsic_candidate_search(
+        query, [decoy_metadata, expected_metadata], k=5
+    )
+
+    assert results[0]["metadata"]["intrinsic_name"] == expected
+    assert results[0]["intrinsic_components"]["operation"] > 0
+    decoy_components = search_module.intrinsic_score_components(
+        search_module.analyze_intrinsic_query(query), decoy_metadata
+    )
+    assert decoy_components["operation"] < 0
+
+
+def test_exact_intrinsic_symbol_keeps_rank_one():
+    expected = _intrinsic_metadata("vaddq_f32", "add")
+    other = _intrinsic_metadata("vaddq_f64", "add", bits=(64,))
+
+    ranked = search_module.rerank_candidates(
+        "vaddq_f32", [_candidate(other), _candidate(expected)]
+    )
+
+    assert ranked[0]["metadata"]["intrinsic_name"] == "vaddq_f32"
+    assert ranked[0]["score_debug"]["contributions"]["intrinsic_structure"] >= 3.0
+
+
+def test_hybrid_search_fuses_separate_intrinsic_candidates(monkeypatch):
+    expected = _intrinsic_metadata(
+        "vaddvq_u8",
+        "reduction_add",
+        input_types=("uint8x16_t",),
+        output_type="uint8_t",
+        output_shape="scalar",
+        lanes=(16,),
+        widths=(128,),
+        bits=(8,),
+        signedness=("unsigned",),
+    )
+    monkeypatch.setattr(search_module, "lexical_prepass_search", lambda *a, **k: [])
+    monkeypatch.setattr(search_module, "embedding_search", lambda *a, **k: [])
+    monkeypatch.setattr(search_module, "bm25_search", lambda *a, **k: [])
+
+    results = search_module.hybrid_search(
+        "horizontal add uint8x16_t neon",
+        usearch_index=None,
+        metadata=[expected],
+        embedding_model=None,
+        bm25_index=None,
+        k=5,
+    )
+
+    assert results[0]["metadata"]["intrinsic_name"] == "vaddvq_u8"
+    assert results[0]["score_debug"]["retrieval"]["intrinsic"]["rank"] == 1
+    assert "intrinsic" in results[0]["score_debug"]["retrieval"]["rrf_contributions"]
+
+
+def test_general_query_does_not_activate_intrinsic_candidate_pass():
+    intrinsic = _intrinsic_metadata("vaddq_f32", "add")
+
+    assert search_module.intrinsic_candidate_search(
+        "install Docker on Ubuntu", [intrinsic], k=5
+    ) == []
