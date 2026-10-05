@@ -38,10 +38,13 @@ jobs:
       - name: Run question suite
         run: |
           mkdir -p "${RUNNER_TEMP}/evaluation-results"
+          touch "${GITHUB_STEP_SUMMARY}"
           docker run --rm --platform linux/arm64 --network none \
             --entrypoint python \
             -e GITHUB_SHA -e EVAL_TARGET="$EVAL_IMAGE" \
+            -e GITHUB_STEP_SUMMARY=/evaluation-summary.md \
             -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            -v "${GITHUB_STEP_SUMMARY}:/evaluation-summary.md" \
             -v "${GITHUB_WORKSPACE}:/evaluation:ro" \
             -v "${RUNNER_TEMP}/evaluation-results:/results" \
             "$EVAL_IMAGE" /evaluation/embedding-generation/evaluate_retrieval.py \
