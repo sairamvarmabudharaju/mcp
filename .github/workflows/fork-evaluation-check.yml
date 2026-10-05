@@ -1,0 +1,61 @@
+name: Fork Evaluation Check
+
+# Temporary fork verification against a published corpus. Keep this helper
+# separate from the upstream PR, which tests the candidate image and corpus.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fork-evaluation-check.yml'
+      - 'arm_kb_search/**'
+      - 'embedding-generation/evaluate_retrieval.py'
+      - 'evals/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    if: ${{ github.repository != 'arm/mcp' }}
+    name: ${{ matrix.suite }} (public 3.1.0 corpus)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [smoke, benchmark]
+    env:
+      # Public 3.1.0 Arm64 release, pinned to the verified immutable digest.
+      EVAL_IMAGE: docker.io/armlimited/arm-mcp@sha256:2a566ae6868b5b0a69917737ad47fd166e1c100b21f678fa0ba04b5490741b3f
+      EVAL_SUITE: ${{ matrix.suite }}
+    steps:
+      - name: Checkout evaluator and questions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Pull public evaluation runtime and corpus
+        run: docker pull --platform linux/arm64 "$EVAL_IMAGE"
+
+      - name: Run question suite
+        run: |
+          mkdir -p "${RUNNER_TEMP}/evaluation-results"
+          docker run --rm --platform linux/arm64 --network none \
+            --entrypoint python \
+            -e GITHUB_SHA -e EVAL_TARGET="$EVAL_IMAGE" \
+            -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            -v "${GITHUB_WORKSPACE}:/evaluation:ro" \
+            -v "${RUNNER_TEMP}/evaluation-results:/results" \
+            "$EVAL_IMAGE" /evaluation/embedding-generation/evaluate_retrieval.py \
+            --suite "$EVAL_SUITE" --top-k 5 \
+            --metadata-path /app/data/metadata.json \
+            --index-path /app/data/usearch_index.bin \
+            --model-path /app/embedding-model \
+            --output "/results/${EVAL_SUITE}.json"
+
+      - name: Retain evaluation report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-evaluation-${{ matrix.suite }}
+          path: ${{ runner.temp }}/evaluation-results/${{ matrix.suite }}.json
+          retention-days: 14
+          if-no-files-found: warn
