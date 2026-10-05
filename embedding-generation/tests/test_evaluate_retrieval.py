@@ -84,6 +84,40 @@ def test_same_miss_gates_only_smoke(inputs, tmp_path, suite, expected_exit):
     assert report["by_topic"]["cloud"]["total"] == 2
 
 
+def test_benchmark_prints_tables_and_retains_details_in_json(
+    inputs, tmp_path, monkeypatch, capsys
+):
+    output = tmp_path / "benchmark.json"
+    actions_summary = tmp_path / "summary.md"
+    actions_summary.write_text("Earlier step\n\n")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(actions_summary))
+    assert runner.main([*inputs[2], "--output", str(output)]) == 0
+    printed = capsys.readouterr().out
+    assert "| Benchmark | 2 | 1 | 50.00% |" in printed
+    assert "| setup | 1 | 1 | 100.00% |" in printed
+    assert "| reference | 1 | 0 | 0.00% |" in printed
+    assert "| cloud | 2 | 1 | 50.00% |" in printed
+    assert printed.index("### By intent") < printed.index("### By topic")
+    assert "MISS" not in printed
+    assert "expected=" not in printed
+    assert "https://example.com/wrong" not in printed
+    summary = actions_summary.read_text()
+    assert summary.startswith("Earlier step\n\n")
+    assert "| cloud | 2 | 1 | 50.00% |" in summary
+    report = json.loads(output.read_text())
+    assert report["cases"][1]["ranked_urls"] == ["https://example.com/wrong"]
+    assert report["summary"]["misses"] == 1
+
+
+def test_table_rates_respect_depth_and_escape_group_names(inputs, tmp_path, capsys):
+    inputs[0][0]["topic"] = "cloud | server\nsetup"
+    inputs[1].write_text(json.dumps(inputs[0]))
+    assert runner.main([*inputs[2], "--top-k", "1"]) == 0
+    printed = capsys.readouterr().out
+    assert "| 50.00% | — | — | 0.500 |" in printed
+    assert "| cloud \\| server setup | 1 | 1 | 100.00% |" in printed
+
+
 @pytest.mark.parametrize("suite", ["smoke", "benchmark"])
 def test_query_errors_fail_both_suites(inputs, monkeypatch, tmp_path, suite):
     def failed_search(*args, **kwargs):

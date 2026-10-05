@@ -124,6 +124,54 @@ def summarize(cases, top_k):
     }
 
 
+def format_summary(report):
+    """Render aggregate results for the terminal and GitHub Actions summary."""
+
+    def percent(value):
+        return f"{value:.2%}" if value is not None else "—"
+
+    def row(label, counts):
+        label = label.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+        rate = counts["hits"] / counts["total"] if counts["total"] else None
+        return f"| {label} | {counts['total']} | {counts['hits']} | {percent(rate)} |"
+
+    summary = report["summary"]
+    metrics = " | ".join(percent(summary[f"hit_at_{k}"]) for k in (1, 3, 5))
+    mrr = f"{summary['mrr']:.3f}" if summary["mrr"] is not None else "—"
+    lines = [
+        f"## {report['suite'].title()} results",
+        "",
+        "| Suite | Questions | Passed | Pass rate | Hit@1 | Hit@3 | Hit@5 | MRR |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        row(report["suite"].title(), summary) + f" {metrics} | {mrr} |",
+        "",
+        f"Pass = an accepted source retrieved within the top {report['top_k']} results.",
+    ]
+    if summary["errors"]:
+        lines += [
+            "",
+            f"**Query errors: {summary['errors']}. These count as unsuccessful in the rates above.**",
+        ]
+    comparison = report.get("comparison")
+    if comparison:
+        lines += [
+            "",
+            f"Baseline comparison: {len(comparison['regressions'])} regressions, {len(comparison['recoveries'])} recoveries.",
+        ]
+    for field in ("intent", "topic"):
+        groups = report.get(f"by_{field}", {})
+        if groups:
+            lines += [
+                "",
+                f"### By {field}",
+                "",
+                f"| {field.title()} | Questions | Passed | Pass rate |",
+                "| --- | ---: | ---: | ---: |",
+                *(row(label, counts) for label, counts in sorted(groups.items())),
+            ]
+    return "\n".join(lines) + "\n"
+
+
 def file_hash(path):
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -307,13 +355,6 @@ def evaluate(
                 )
                 for group in groups
             }
-    for metric, value in report["summary"].items():
-        print(f"{metric}: {value}")
-    for case in cases:
-        if case["match_rank"] is None:
-            print(
-                f"{case['question_id']}: {case['error'] or 'MISS'}; expected={case['expected_urls']}; got={case['ranked_urls']}"
-            )
     if previous and not result.errors:
         old = {case["question_id"]: case for case in previous["cases"]}
         report["comparison"] = {
@@ -337,10 +378,18 @@ def evaluate(
                 if report["summary"][key] is not None
             },
         }
-        print("Comparison:", json.dumps(report["comparison"]))
-    elif not previous:
-        print("No baseline supplied; regression comparison unavailable.")
     write_report(output, report)
+    summary_text = format_summary(report)
+    print(summary_text)
+    if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(summary_path, "a", encoding="utf-8") as summary_file:
+            summary_file.write(summary_text + "\n")
+    if suite == "smoke":
+        for case in cases:
+            if case["match_rank"] is None:
+                print(
+                    f"{case['question_id']}: {case['error'] or 'MISS'}; expected={case['expected_urls']}; got={case['ranked_urls']}"
+                )
     return 2 if result.errors else int(suite == "smoke" and bool(result.misses))
 
 

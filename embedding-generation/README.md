@@ -172,9 +172,12 @@ Matching preserves the existing suite policies:
   and package/intrinsic selectors. Only tracking `utm_*` parameters, query-pair
   order, host/scheme case, and trailing slashes are normalized.
 
-Console output and JSON contain metrics, per-question ranks/URLs/errors,
-category summaries, and corpus/model/code identity. Errors are separate from
-misses and contribute zero to headline rates. Benchmark comparisons show metric
+Console output and the GitHub Actions Summary show tables with overall pass
+percentage and retrieval metrics, followed by intent and topic pass percentages.
+The benchmark does not print individual misses. Download the JSON artifact for
+per-question ranks/URLs/errors, category metrics, and corpus/model/code identity.
+Errors are separate from misses and contribute zero to headline rates.
+Benchmark comparisons show metric
 deltas and regressed/recovered IDs only for identical selected questions,
 matching rules, and depth, with no execution errors. A changed suite needs a
 fresh baseline. No supplied baseline means no regression claim.

@@ -119,10 +119,13 @@ jobs:
         timeout-minutes: 15
         run: |
           mkdir -p "${RUNNER_TEMP}/retrieval-smoke"
+          touch "${GITHUB_STEP_SUMMARY}"
           docker run --rm --network none \
             --entrypoint python \
             -e GITHUB_SHA \
+            -e GITHUB_STEP_SUMMARY=/evaluation-summary.md \
             -e EVAL_TARGET="$(docker image inspect --format '{{.Id}}' arm-mcp:latest)" \
+            -v "${GITHUB_STEP_SUMMARY}:/evaluation-summary.md" \
             -v "${GITHUB_WORKSPACE}:/evaluation:ro" \
             -v "${RUNNER_TEMP}/retrieval-smoke:/results" \
             arm-mcp:latest /evaluation/embedding-generation/evaluate_retrieval.py \
